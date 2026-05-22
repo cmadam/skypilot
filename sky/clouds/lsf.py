@@ -2,13 +2,12 @@
 import functools
 import logging
 import typing
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 from sky import clouds
 from sky import exceptions
 from sky import sky_logging
 from sky import skypilot_config
-from sky.clouds import service_catalog
 from sky.provision.lsf import utils as lsf_utils
 from sky.utils import annotations
 from sky.utils import registry
@@ -268,7 +267,8 @@ class LSF(clouds.Cloud):
         return resources_utils.FeasibleResources([r], [], None)
 
     @classmethod
-    def check_credentials(cls) -> Tuple[bool, Optional[str]]:
+    def _check_compute_credentials(
+            cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
         """Check if LSF credentials are configured."""
         allowed_clusters = cls.existing_allowed_clusters()
         if not allowed_clusters:
@@ -375,12 +375,6 @@ class LSF(clouds.Cloud):
         }
 
         return deploy_vars
-
-    @classmethod
-    def _check_compute_credentials(
-        cls,
-    ) -> Tuple[bool, Optional[str]]:
-        return cls.check_credentials()
 
     def __repr__(self):
         return self._REPR

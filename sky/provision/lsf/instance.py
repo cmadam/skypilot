@@ -14,7 +14,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from sky import sky_logging
-from sky import status_lib
+from sky.utils import status_lib
 from sky.adaptors import lsf as lsf_adaptor
 from sky.provision import common
 from sky.provision.lsf import utils as lsf_utils
