@@ -1,0 +1,83 @@
+cluster_name: {{cluster_name_on_cloud}}
+
+max_workers: {{num_nodes - 1}}
+upscaling_speed: {{num_nodes - 1}}
+idle_timeout_minutes: 60
+
+provider:
+  type: external
+  module: sky.provision.lsf
+
+  cluster: "{{lsf_cluster}}"
+{% if lsf_queue is not none %}
+  queue: "{{lsf_queue}}"
+{% endif %}
+
+  ssh:
+    hostname: {{ssh_hostname}}
+    port: {{ssh_port}}
+    user: {{ssh_user}}
+{% if lsf_private_key %}
+    private_key: {{lsf_private_key}}
+{% endif %}
+{% if lsf_proxy_command %}
+    proxy_command: {{lsf_proxy_command | tojson }}
+{% endif %}
+{% if lsf_proxy_jump %}
+    proxy_jump: {{lsf_proxy_jump | tojson }}
+{% endif %}
+    identities_only: {{lsf_identities_only}}
+
+  # Resource configuration passed to provisioner
+  cpus: "{{cpus}}"
+  memory: "{{memory}}"
+  accelerator_type: "{{accelerator_type}}"
+  accelerator_count: "{{accelerator_count}}"
+{% if image_id %}
+  image_id: "{{image_id}}"
+{% endif %}
+
+  # Enroot container configuration
+  enroot_enabled: "{{enroot_enabled}}"
+  enroot_share_path: "{{enroot_share_path}}"
+  enroot_use_local_nvme: "{{enroot_use_local_nvme}}"
+  enroot_squash_options: "{{enroot_squash_options}}"
+{% if nccl_tuning_file %}
+  nccl_tuning_file: "{{nccl_tuning_file}}"
+{% endif %}
+
+  # Working directories
+{% if workdir %}
+  workdir: "{{workdir}}"
+{% endif %}
+{% if tmpdir %}
+  tmpdir: "{{tmpdir}}"
+{% endif %}
+
+  # Custom bsub options
+{% if bsub_options %}
+  bsub_options:
+{% for key, val in bsub_options.items() %}
+    {{key}}: "{{val}}"
+{% endfor %}
+{% endif %}
+
+auth:
+  ssh_user: {{ssh_user}}
+  ssh_private_key: {{ssh_private_key}}
+
+available_node_types:
+  ray_head_default:
+    resources: {}
+    node_config:
+      instance_type: {{instance_type}}
+      disk_size: {{disk_size}}
+      cpus: {{cpus}}
+      memory: {{memory}}
+      accelerator_type: {{accelerator_type}}
+      accelerator_count: {{accelerator_count}}
+{% if image_id %}
+      image_id: {{image_id}}
+{% endif %}
+
+head_node_type: ray_head_default

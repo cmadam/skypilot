@@ -23,6 +23,7 @@ from sky.clouds.hyperbolic import Hyperbolic
 from sky.clouds.ibm import IBM
 from sky.clouds.kubernetes import Kubernetes
 from sky.clouds.lambda_cloud import Lambda
+from sky.clouds.lsf import LSF
 from sky.clouds.mithril import Mithril
 from sky.clouds.nebius import Nebius
 from sky.clouds.oci import OCI
@@ -48,6 +49,7 @@ __all__ = [
     'DummyCloud',
     'GCP',
     'Lambda',
+    'LSF',
     'DO',
     'Paperspace',
     'PrimeIntellect',
