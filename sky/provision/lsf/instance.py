@@ -86,6 +86,15 @@ def _convert_to_enroot_uri(image_id: str) -> str:
     return image_id
 
 
+def _sqsh_name_from_image(image_id: str) -> str:
+    """Derive sqsh filename from image name (shared across all jobs using same image).
+
+    e.g. us.icr.io/cil15-shared-registry/sage-py311:0.025
+      -> us.icr.io-cil15-shared-registry-sage-py311-0.025.sqsh
+    """
+    return image_id.replace('/', '-').replace(':', '-') + '.sqsh'
+
+
 def _build_enroot_block(image_id: str, container_name: str,
                         enroot_config: Dict[str, Any],
                         env_vars: Dict[str, str],
@@ -93,12 +102,15 @@ def _build_enroot_block(image_id: str, container_name: str,
                         is_multinode: bool = False) -> str:
     """Build the full enroot setup block with BlueVela workarounds.
 
-    Generates a bash block that:
-    1. Creates temporary wrapper scripts for BlueVela workarounds
-    2. Sets up enroot paths (NVME or shared FS)
-    3. Imports Docker image to squash (with shared FS caching)
-    4. Flattens layered OCI images if needed
-    5. Creates and starts the container
+    Container isolation strategy (per gbansible guidelines):
+    - Sqsh file: derived from IMAGE NAME, shared on shared FS (all jobs
+      using the same image reuse the same sqsh)
+    - Container name: derived from JOB NAME (cluster_name_on_cloud),
+      unique per job — prevents concurrent jobs from destroying each
+      other's containers via enroot create -f or enroot remove -f
+    - Distributed env vars (RANK, WORLD_SIZE, etc.): only injected for
+      multi-node jobs; unset for single-node to prevent PyTorch DTensor
+      initialization errors in eval/inference workloads
     """
     share_path = enroot_config.get('share_path', '/tmp')
     squash_options = enroot_config.get('squash_options',
@@ -106,19 +118,37 @@ def _build_enroot_block(image_id: str, container_name: str,
     use_nvme = enroot_config.get('use_local_nvme', False)
 
     enroot_uri = _convert_to_enroot_uri(image_id)
+    # Container name is job-specific (prevents concurrent job interference)
     container_name_safe = container_name.replace('/', '-').replace(':', '-')
-    sqsh_file = f'{share_path}/enroot/{container_name_safe}.sqsh'
+    # Sqsh file is image-specific (shared across all jobs using same image)
+    sqsh_filename = _sqsh_name_from_image(image_id)
+    sqsh_file = f'{share_path}/enroot/{sqsh_filename}'
 
     enroot_data_path = ('/opt/nvme/$USER/enroot-data'
                         if use_nvme else f'{share_path}/user-$(id -u)/enroot-data')
 
-    # Build environment lines for enroot config
-    env_lines = '    echo "NVIDIA_VISIBLE_DEVICES=all"\n'
-    env_lines += '    echo "NVIDIA_DRIVER_CAPABILITIES=compute,utility"\n'
-    env_lines += ('    echo "LD_LIBRARY_PATH='
-                  '/opt/share/mpich-4.2.2/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n')
+    # Static env lines (written via quoted heredoc — no shell expansion)
+    static_env_lines = '    echo "NVIDIA_VISIBLE_DEVICES=all"\n'
+    static_env_lines += '    echo "NVIDIA_DRIVER_CAPABILITIES=compute,utility"\n'
+    static_env_lines += ('    echo "LD_LIBRARY_PATH='
+                         '/opt/share/mpich-4.2.2/lib'
+                         '${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n')
     for key, val in env_vars.items():
-        env_lines += f'    echo "{key}={val}"\n'
+        static_env_lines += f'    echo "{key}={val}"\n'
+
+    # Dynamic env lines (written via unquoted heredoc — vars expand at
+    # config-write time). Only for multi-node: single-node eval/inference
+    # must NOT have RANK/WORLD_SIZE set — their presence triggers PyTorch
+    # DTensor initialization, causing "mixed Tensor/DTensor" errors.
+    dynamic_env_lines = ''
+    if is_multinode:
+        dynamic_env_lines = (
+            '    echo "RANK=${RANK}"\n'
+            '    echo "WORLD_SIZE=${WORLD_SIZE}"\n'
+            '    echo "LOCAL_RANK=${LOCAL_RANK}"\n'
+            '    echo "MASTER_ADDR=${MASTER_HOST}"\n'
+            '    echo "MASTER_PORT=${MASTER_PORT:-29500}"\n'
+        )
 
     # Build mount lines for enroot config
     mount_lines = '    echo "/proj /proj"\n'
@@ -211,23 +241,29 @@ def _build_enroot_block(image_id: str, container_name: str,
         }}
 
         # ── Step 1: Import + Flatten (master only for multi-node) ─────────────
+        # Uses flock to prevent concurrent imports of the same image by
+        # multiple jobs. Only one job proceeds with import; others wait.
         if [[ "${{BV_WORKER}}" != "1" ]]; then
-            if [[ -f "$SQSH_FILE" ]]; then
-                echo "[$(date)] Squash file exists: $SQSH_FILE ($(du -h "$SQSH_FILE" | cut -f1)), skipping import"
-            else
-                echo "[$(date)] Importing docker://{enroot_uri} → $SQSH_FILE"
-                if ! enroot import -o "$SQSH_FILE" "docker://{enroot_uri}"; then
-                    if [[ -f "$SQSH_FILE" ]] && [[ -s "$SQSH_FILE" ]]; then
-                        echo "[$(date)] Import completed with warnings (sqsh file was created)"
-                    else
-                        echo "ERROR: enroot import failed for {image_id}"
-                        exit 1
+            LOCK_FILE="${{SQSH_FILE}}.lock"
+            (
+                flock -x 200
+                if [[ -f "$SQSH_FILE" ]]; then
+                    echo "[$(date)] Squash file exists: $SQSH_FILE ($(du -h "$SQSH_FILE" | cut -f1)), skipping import"
+                else
+                    echo "[$(date)] Importing docker://{enroot_uri} → $SQSH_FILE"
+                    if ! enroot import -o "$SQSH_FILE" "docker://{enroot_uri}"; then
+                        if [[ -f "$SQSH_FILE" ]] && [[ -s "$SQSH_FILE" ]]; then
+                            echo "[$(date)] Import completed with warnings (sqsh file was created)"
+                        else
+                            echo "ERROR: enroot import failed for {image_id}"
+                            exit 1
+                        fi
                     fi
+                    chmod g+rw "$SQSH_FILE" 2>/dev/null || true
+                    echo "[$(date)] Import complete: $(du -h "$SQSH_FILE" | cut -f1)"
+                    flatten_sqsh_if_needed "$SQSH_FILE"
                 fi
-                chmod g+rw "$SQSH_FILE" 2>/dev/null || true
-                echo "[$(date)] Import complete: $(du -h "$SQSH_FILE" | cut -f1)"
-            fi
-            flatten_sqsh_if_needed "$SQSH_FILE"
+            ) 200>"$LOCK_FILE"
         fi
         {_build_blaunch_dispatch(share_path, is_multinode)}
         # ── NVME pre-flight check ─────────────────────────────────────────────
@@ -244,9 +280,10 @@ def _build_enroot_block(image_id: str, container_name: str,
         }}
         chmod -R a+rw "$ENROOT_DATA_PATH/$CONTAINER_NAME" 2>/dev/null || true
 
-        # Kill catatonit orphans from import/create
-        ps -fu "$USER" | grep "catatonit" | grep -v "grep" | awk '{{print $2}}' \\
-            | xargs -I{{}} kill -9 {{}} 2>/dev/null || true
+        # Kill catatonit orphans spawned by THIS container's create only.
+        # Scoped to children of this shell to avoid killing other jobs'
+        # catatonit processes (which would destroy their containers).
+        pkill -9 -P $$ -x catatonit 2>/dev/null || true
 
         # Replace entrypoint with passthrough
         CONTAINER_RC="$ENROOT_DATA_PATH/$CONTAINER_NAME/etc/rc"
@@ -265,13 +302,17 @@ def _build_enroot_block(image_id: str, container_name: str,
 
         # ── Step 3: Generate enroot config and start ──────────────────────────
         ENROOT_CONFIG_FILE=$(mktemp -t enroot.config.XXXXXX)
-        cat > "$ENROOT_CONFIG_FILE" << 'ENROOT_CFG_HEADER'
+        # Static part (quoted heredoc — no shell expansion)
+        cat > "$ENROOT_CONFIG_FILE" << 'ENROOT_CFG_STATIC'
         environ() {{
             env
-        {env_lines}}}
+        {static_env_lines}ENROOT_CFG_STATIC
+        # Dynamic part (unquoted heredoc — RANK/WORLD_SIZE expand now)
+        cat >> "$ENROOT_CONFIG_FILE" << ENROOT_CFG_DYNAMIC
+        {dynamic_env_lines}}}
         mounts() {{
         {mount_lines}}}
-        ENROOT_CFG_HEADER
+        ENROOT_CFG_DYNAMIC
 
         echo "[$(date)] Starting container: enroot start --conf $ENROOT_CONFIG_FILE --rw $CONTAINER_NAME"
         enroot start --conf "$ENROOT_CONFIG_FILE" --rw "$CONTAINER_NAME" \\
@@ -417,9 +458,8 @@ def _build_bsub_script(
             echo "[$(date)] Cleaning up SkyPilot LSF instance..."
             # Kill background processes (enroot sleep infinity, etc.)
             kill $(jobs -p) 2>/dev/null || true
-            # Kill catatonit orphans
-            ps -fu "$USER" | grep "catatonit" | grep -v "grep" | awk '{{print $2}}' \\
-                | xargs -I{{}} kill -9 {{}} 2>/dev/null || true
+            # Kill catatonit orphans (scoped to this job's process tree)
+            pkill -9 -P $$ -x catatonit 2>/dev/null || true
             # Remove enroot container if it exists
             if command -v enroot &>/dev/null && [[ -n "${{CONTAINER_NAME:-}}" ]]; then
                 enroot remove -f "$CONTAINER_NAME" 2>/dev/null || true
