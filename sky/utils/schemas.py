@@ -2004,6 +2004,96 @@ def get_config_schema():
                 },
             }
         },
+        'lsf': {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': False,
+            'properties': {
+                'allowed_clusters': {
+                    'oneOf': [{
+                        'type': 'array',
+                        'items': {
+                            'type': 'string',
+                        },
+                    }, {
+                        'type': 'string',
+                        'pattern': '^all$'
+                    }]
+                },
+                'provision_timeout': {
+                    'type': 'integer',
+                },
+                'pricing': _PRICING_SCHEMA,
+                'cluster_configs': {
+                    'type': 'object',
+                    'required': [],
+                    'properties': {},
+                    'additionalProperties': {
+                        'type': 'object',
+                        'required': [],
+                        'additionalProperties': False,
+                        'properties': {
+                            'workdir': {
+                                'type': 'string',
+                            },
+                            'tmpdir': {
+                                'type': 'string',
+                            },
+                            'pricing': _PRICING_SCHEMA,
+                            'bsub_options': {
+                                'type': 'object',
+                                'required': [],
+                                'additionalProperties': {
+                                    'type': 'string',
+                                },
+                            },
+                            'nccl_tuning_file': {
+                                'type': 'string',
+                            },
+                            'enroot': {
+                                'type': 'object',
+                                'required': [],
+                                'additionalProperties': False,
+                                'properties': {
+                                    'enabled': {
+                                        'type': 'boolean',
+                                    },
+                                    'share_path': {
+                                        'type': 'string',
+                                    },
+                                    'use_local_nvme': {
+                                        'type': 'boolean',
+                                    },
+                                    'squash_options': {
+                                        'type': 'string',
+                                    },
+                                },
+                            },
+                            'queue_configs': {
+                                'type': 'object',
+                                'required': [],
+                                'properties': {},
+                                'additionalProperties': {
+                                    'type': 'object',
+                                    'required': [],
+                                    'additionalProperties': False,
+                                    'properties': {
+                                        'pricing': _PRICING_SCHEMA,
+                                        'bsub_options': {
+                                            'type': 'object',
+                                            'required': [],
+                                            'additionalProperties': {
+                                                'type': 'string',
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            }
+        },
         'oci': {
             'type': 'object',
             'required': [],
