@@ -46,6 +46,16 @@ class LSF(clouds.Cloud):
             ('LSF does not support host controllers.'),
         clouds.CloudImplementationFeatures.LOCAL_DISK:
             ('LSF does not support local disk requests.'),
+        clouds.CloudImplementationFeatures.CLONE_DISK_FROM_CLUSTER:
+            ('LSF does not support disk cloning.'),
+        clouds.CloudImplementationFeatures.CUSTOM_DISK_TIER:
+            ('LSF does not support custom disk tiers.'),
+        clouds.CloudImplementationFeatures.CUSTOM_MULTI_NETWORK:
+            ('LSF does not support custom multi-network.'),
+        clouds.CloudImplementationFeatures.AUTO_TERMINATE:
+            ('LSF does not support auto-terminate.'),
+        clouds.CloudImplementationFeatures.AUTODOWN:
+            ('LSF does not support autodown.'),
     }
     _DYNAMICALLY_CHECKED_FEATURES = {
         clouds.CloudImplementationFeatures.DOCKER_IMAGE,
@@ -60,15 +70,16 @@ class LSF(clouds.Cloud):
 
     @classmethod
     def _unsupported_features_for_resources(
-        cls, resources: 'resources_lib.Resources'
+        cls, resources: 'resources_lib.Resources',
+        region: Optional[str] = None,
     ) -> Dict[clouds.CloudImplementationFeatures, str]:
         unsupported = cls._CLOUD_UNSUPPORTED_FEATURES.copy()
 
         # Docker image support depends on enroot availability
-        infra = resources.infra
-        if infra is not None:
-            parts = infra.split('/')
-            cluster = parts[1] if len(parts) > 1 else parts[0]
+        cluster = region
+        if cluster is None and resources.infra is not None:
+            cluster = resources.infra.region
+        if cluster is not None:
             if not lsf_utils.check_enroot_enabled(cluster):
                 unsupported[clouds.CloudImplementationFeatures.DOCKER_IMAGE] = (
                     'Docker image support requires enroot on the LSF cluster. '
@@ -118,6 +129,7 @@ class LSF(clouds.Cloud):
         use_spot: bool,
         region: Optional[str],
         zone: Optional[str],
+        resources: Optional['resources_lib.Resources'] = None,
     ) -> List[clouds.Region]:
         """Returns regions (clusters) with the requested resources.
 
@@ -316,15 +328,15 @@ class LSF(clouds.Cloud):
     def get_image_size(self, image_id: str, region: Optional[str]) -> float:
         return 0.0
 
-    @classmethod
     def make_deploy_resources_variables(
-        cls,
+        self,
         resources: 'resources_lib.Resources',
         cluster_name: 'resources_lib.ClusterName',
         region: clouds.Region,
         zones: Optional[List[clouds.Zone]],
         num_nodes: int,
         dryrun: bool = False,
+        volume_mounts: Optional[List] = None,
     ) -> Dict[str, Optional[str]]:
         """Convert Resources to LSF-specific deployment variables."""
         cluster = region.name

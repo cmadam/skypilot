@@ -1066,3 +1066,126 @@ class SlurmCodeGen(TaskCodeGen):
                 returncodes = [0]
             """),
         ]
+
+
+class LsfCodeGen(TaskCodeGen):
+    """Code generator for task execution on LSF via direct subprocess."""
+
+    def add_prologue(self, job_id: int) -> None:
+        assert not self._has_prologue, 'add_prologue() called twice?'
+        self._has_prologue = True
+        self.job_id = job_id
+
+        self._add_common_imports()
+        self._code.append(
+            textwrap.dedent("""\
+            import copy
+            import multiprocessing
+            import multiprocessing.pool
+            import threading
+            """))
+        self._add_skylet_imports()
+        self._add_constants()
+        self._add_logging_functions()
+
+        self._code += [
+            'autostop_lib.set_last_active_time_to_now()',
+            f'job_lib.set_status({job_id!r}, job_lib.JobStatus.PENDING)',
+        ]
+
+    def add_setup(
+        self,
+        num_nodes: int,
+        resources_dict: Dict[str, float],
+        stable_cluster_internal_ips: List[str],
+        env_vars: Dict[str, str],
+        log_dir: str,
+        setup_cmd: Optional[str] = None,
+    ) -> None:
+        assert self._has_prologue, 'Call add_prologue() before add_setup().'
+        self._has_setup = True
+        self._cluster_num_nodes = len(stable_cluster_internal_ips)
+        self._stable_cluster_ips = stable_cluster_internal_ips
+
+        self._add_waiting_for_resources_msg(num_nodes)
+
+        if setup_cmd is not None:
+            setup_script = self.build_task_bash_script(setup_cmd)
+            self._code.append(
+                textwrap.dedent(f"""\
+                setup_env = {{}}
+                setup_env['{constants.SKYPILOT_NUM_NODES}'] = '1'
+                setup_env['SKYPILOT_NODE_RANK'] = '0'
+                setup_env['SKYPILOT_INTERNAL_JOB_ID'] = str({job_id!r})
+                setup_log = os.path.expanduser(os.path.join({log_dir!r}, 'setup.log'))
+                setup_rc = run_bash_command_with_log(
+                    {setup_script!r},
+                    setup_log,
+                    env_vars=setup_env,
+                    stream_logs=True)
+                if setup_rc != 0:
+                    job_lib.set_status({job_id!r}, job_lib.JobStatus.FAILED_SETUP)
+                    print(f'ERROR: Setup failed with return code {{setup_rc}}', flush=True)
+                    sys.exit(1)
+                """))
+
+    def add_task(
+        self,
+        num_nodes: int,
+        bash_script: Optional[str],
+        task_name: Optional[str],
+        resources_dict: Dict[str, float],
+        log_dir: str,
+        env_vars: Optional[Dict[str, str]] = None,
+    ) -> None:
+        assert self._has_setup, 'Call add_setup() before add_task().'
+        env_vars = env_vars or {}
+        task_name = task_name if task_name is not None else 'task'
+
+        acc_name, acc_count = self._get_accelerator_details(resources_dict)
+        num_gpus = 0
+        if (acc_name is not None and
+                not accelerator_registry.is_schedulable_non_gpu_accelerator(
+                    acc_name)):
+            num_gpus = int(math.ceil(acc_count))
+
+        task_bash_script = (self.build_task_bash_script(bash_script or '')
+                            if bash_script else '')
+        streaming_msg = self._get_job_started_msg()
+
+        sky_env_vars_dict_str = [
+            textwrap.dedent(f"""\
+            sky_env_vars_dict = {{}}
+            sky_env_vars_dict['SKYPILOT_INTERNAL_JOB_ID'] = {self.job_id}
+            """)
+        ]
+        if env_vars:
+            sky_env_vars_dict_str.extend(f'sky_env_vars_dict[{k!r}] = {v!r}'
+                                         for k, v in env_vars.items())
+        sky_env_vars_dict_str = '\n'.join(sky_env_vars_dict_str)
+
+        self._code += [
+            f'print({streaming_msg!r}, flush=True)',
+            f'job_lib.set_job_started({self.job_id!r})',
+            'job_lib.scheduler.schedule_step()',
+            sky_env_vars_dict_str,
+            textwrap.dedent(f"""\
+            script = {task_bash_script!r}
+
+            if script:
+                sky_env_vars_dict['{constants.SKYPILOT_NUM_GPUS_PER_NODE}'] = {num_gpus}
+                sky_env_vars_dict['SKYPILOT_NODE_RANK'] = 0
+                sky_env_vars_dict['SKYPILOT_NODE_IPS'] = '127.0.0.1'
+                sky_env_vars_dict['{constants.SKYPILOT_NUM_NODES}'] = 1
+
+                log_path = os.path.expanduser(os.path.join({log_dir!r}, 'run.log'))
+                result = run_bash_command_with_log_and_return_pid(
+                    script,
+                    log_path,
+                    env_vars=sky_env_vars_dict,
+                    stream_logs=True)
+                returncodes = [int(result.get('return_code', 1))]
+            else:
+                returncodes = [0]
+            """),
+        ]

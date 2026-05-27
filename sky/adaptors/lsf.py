@@ -38,6 +38,7 @@ class LsfQueue(NamedTuple):
     """Information about an LSF queue."""
     name: str
     is_default: bool
+    is_open: bool
     # Maximum runtime in seconds, None if unlimited
     max_runtime: Optional[int]
 
@@ -279,13 +280,17 @@ class LsfClient:
             cmd = f'bkill -s {signal} -J {shlex.quote(job_name)}'
 
         rc, stdout, stderr = self._run_lsf_cmd(cmd)
-        # bkill returns non-zero if job is already done
-        if rc != 0 and 'already finished' not in stderr:
+        combined = f'{stdout}\n{stderr}'
+        if rc != 0:
+            if ('not found' in combined or 'already finished' in combined or
+                    'No matching job' in combined):
+                logger.debug(f'Job {job_name} not found or already done')
+                return
             subprocess_utils.handle_returncode(
                 rc,
                 cmd,
                 f'Failed to cancel job {job_name}.',
-                stderr=f'{stdout}\n{stderr}',
+                stderr=combined,
                 stream_logs=False)
         logger.debug(f'Successfully cancelled job {job_name}: {stdout}')
 
@@ -327,6 +332,19 @@ class LsfClient:
             stream_logs=False)
         return stdout
 
+    @staticmethod
+    def _parse_mem(mem_str: str) -> float:
+        """Parse LSF memory string (e.g. '1.9T', '1006.8G', '1031047M')."""
+        if mem_str == '-':
+            return 0.0
+        if mem_str.endswith('T'):
+            return float(mem_str[:-1]) * 1024.0
+        if mem_str.endswith('G'):
+            return float(mem_str[:-1])
+        if mem_str.endswith('M'):
+            return float(mem_str[:-1]) / 1024.0
+        return float(mem_str) / 1024.0
+
     def info_nodes(self) -> List[NodeInfo]:
         """Get LSF host information with GPU details.
 
@@ -334,10 +352,11 @@ class LsfClient:
         Uses lshosts for static info and bhosts for dynamic status.
         """
         # Get static host info (CPUs, memory)
-        cmd = 'lshosts -w -o "HOST_NAME maxCpus maxMem"'
+        # Try compact -o format first (3 columns: HOST_NAME ncpus maxmem)
+        cmd = 'lshosts -o "HOST_NAME ncpus maxmem"'
         rc, stdout, stderr = self._run_lsf_cmd(cmd)
+        use_compact_format = (rc == 0)
         if rc != 0:
-            # Fall back to simpler format
             cmd = 'lshosts -w'
             rc, stdout, stderr = self._run_lsf_cmd(cmd)
             subprocess_utils.handle_returncode(
@@ -349,29 +368,36 @@ class LsfClient:
 
         host_info: Dict[str, Dict] = {}
         lines = stdout.strip().splitlines()
-        for line in lines[1:]:  # Skip header
-            parts = line.split()
-            if len(parts) >= 3:
-                hostname = parts[0]
-                try:
-                    cpus = int(parts[1]) if parts[1] != '-' else 0
-                    mem_str = parts[2]
-                    if mem_str.endswith('G'):
-                        memory_gb = float(mem_str[:-1])
-                    elif mem_str.endswith('M'):
-                        memory_gb = float(mem_str[:-1]) / 1024.0
-                    elif mem_str.endswith('T'):
-                        memory_gb = float(mem_str[:-1]) * 1024.0
-                    elif mem_str == '-':
-                        memory_gb = 0.0
-                    else:
-                        memory_gb = float(mem_str) / 1024.0
-                    host_info[hostname] = {
-                        'cpus': cpus,
-                        'memory_gb': memory_gb,
-                    }
-                except (ValueError, IndexError):
-                    continue
+        if use_compact_format:
+            # -o format: HOST_NAME ncpus maxmem
+            for line in lines[1:]:
+                parts = line.split()
+                if len(parts) >= 3:
+                    hostname = parts[0]
+                    try:
+                        cpus = int(parts[1]) if parts[1] != '-' else 0
+                        memory_gb = self._parse_mem(parts[2])
+                        host_info[hostname] = {
+                            'cpus': cpus,
+                            'memory_gb': memory_gb,
+                        }
+                    except (ValueError, IndexError):
+                        continue
+        else:
+            # lshosts -w format: HOST_NAME type model cpuf ncpus maxmem ...
+            for line in lines[1:]:
+                parts = line.split()
+                if len(parts) >= 6:
+                    hostname = parts[0]
+                    try:
+                        cpus = int(parts[4]) if parts[4] != '-' else 0
+                        memory_gb = self._parse_mem(parts[5])
+                        host_info[hostname] = {
+                            'cpus': cpus,
+                            'memory_gb': memory_gb,
+                        }
+                    except (ValueError, IndexError):
+                        continue
 
         # Get dynamic host status
         cmd = 'bhosts -w'
@@ -420,28 +446,34 @@ class LsfClient:
 
         Returns:
             Dict mapping hostname -> {'count': int, 'model': str}
+
+        Parses `lshosts -gpu` output where each GPU gets a line. The
+        hostname appears only on the first GPU line for each host;
+        subsequent lines for the same host have leading whitespace.
         """
-        # Try lshosts with GPU resource
         cmd = 'lshosts -gpu -w'
         rc, stdout, stderr = self._run_lsf_cmd(cmd)
         if rc != 0:
             return {}
 
         gpu_info: Dict[str, Dict] = {}
+        current_host: Optional[str] = None
         lines = stdout.strip().splitlines()
         for line in lines[1:]:  # Skip header
-            parts = line.split()
-            if len(parts) >= 4:
-                hostname = parts[0]
-                try:
-                    gpu_count = int(parts[1]) if parts[1] != '-' else 0
-                    gpu_model = parts[3] if len(parts) > 3 else ''
-                    gpu_info[hostname] = {
-                        'count': gpu_count,
+            if not line.strip():
+                continue
+            if not line[0].isspace():
+                parts = line.split()
+                if len(parts) >= 3:
+                    current_host = parts[0]
+                    gpu_model = parts[2]
+                    gpu_info[current_host] = {
+                        'count': 1,
                         'model': gpu_model,
                     }
-                except (ValueError, IndexError):
-                    continue
+            else:
+                if current_host is not None and current_host in gpu_info:
+                    gpu_info[current_host]['count'] += 1
         return gpu_info
 
     def check_job_has_nodes(self, job_id: str) -> bool:
@@ -573,38 +605,33 @@ class LsfClient:
 
         Returns:
             List of LsfQueue objects.
+
+        Uses `bqueues -w` which outputs:
+        QUEUE_NAME PRIO STATUS MAX JL/U JL/P JL/H NJOBS PEND RUN SUSP RSV PJOBS
         """
-        cmd = 'bqueues -w -o "QUEUE_NAME DEFAULT RUNLIMIT"'
+        cmd = 'bqueues -w'
         rc, stdout, stderr = self._run_lsf_cmd(cmd)
-        if rc != 0:
-            # Fall back to simpler bqueues
-            cmd = 'bqueues -w'
-            rc, stdout, stderr = self._run_lsf_cmd(cmd)
-            subprocess_utils.handle_returncode(
-                rc,
-                cmd,
-                'Failed to get LSF queues.',
-                stderr=f'{stdout}\n{stderr}',
-                stream_logs=False)
+        subprocess_utils.handle_returncode(
+            rc,
+            cmd,
+            'Failed to get LSF queues.',
+            stderr=f'{stdout}\n{stderr}',
+            stream_logs=False)
 
         queues = []
         lines = stdout.strip().splitlines()
         for line in lines[1:]:  # Skip header
             parts = line.split()
-            if not parts:
+            if len(parts) < 3:
                 continue
             name = parts[0]
-            is_default = len(parts) > 1 and parts[1].lower() == 'yes'
-            max_runtime = None
-            if len(parts) > 2 and parts[2] != '-':
-                try:
-                    max_runtime = int(float(parts[2]) * 60)
-                except ValueError:
-                    pass
+            status = parts[2]  # e.g. "Open:Active", "Closed:Inact_Adm"
+            is_open = status.lower().startswith('open')
             queues.append(LsfQueue(
                 name=name,
-                is_default=is_default,
-                max_runtime=max_runtime,
+                is_default=False,
+                is_open=is_open,
+                max_runtime=None,
             ))
         return queues
 

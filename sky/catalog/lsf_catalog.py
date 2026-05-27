@@ -110,6 +110,30 @@ def _get_pricing(region: Optional[str],
     return merged
 
 
+def validate_region_zone(
+    region_name: Optional[str],
+    zone_name: Optional[str],
+) -> Tuple[Optional[str], Optional[str]]:
+    return (region_name, zone_name)
+
+
+def list_accelerators(
+    gpus_only: bool = True,
+    name_filter: Optional[str] = None,
+    region_filter: Optional[str] = None,
+    quantity_filter: Optional[int] = None,
+    case_sensitive: bool = True,
+) -> Dict[str, List[Dict]]:
+    acc_info, _, _ = list_accelerators_realtime(
+        gpus_only=gpus_only,
+        name_filter=name_filter,
+        region_filter=region_filter,
+        quantity_filter=quantity_filter,
+        case_sensitive=case_sensitive,
+    )
+    return acc_info
+
+
 def list_accelerators_realtime(
     gpus_only: bool = True,
     name_filter: Optional[str] = None,

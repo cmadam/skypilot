@@ -64,7 +64,7 @@ provider:
 
 auth:
   ssh_user: {{ssh_user}}
-  ssh_private_key: {{ssh_private_key}}
+  ssh_private_key: {{lsf_private_key}}
 
 available_node_types:
   ray_head_default:
@@ -81,3 +81,17 @@ available_node_types:
 {% endif %}
 
 head_node_type: ray_head_default
+
+file_mounts: {
+  "{{sky_ray_yaml_remote_path}}": "{{sky_ray_yaml_local_path}}",
+  "{{sky_remote_path}}/{{sky_wheel_hash}}": "{{sky_local_path}}",
+{%- for remote_path, local_path in credentials.items() %}
+  "{{remote_path}}": "{{local_path}}",
+{%- endfor %}
+}
+
+setup_commands:
+  - |
+    {{ setup_sky_dirs_commands }}
+    {{ uv_installation_commands }}
+    {{ skypilot_wheel_installation_commands }}

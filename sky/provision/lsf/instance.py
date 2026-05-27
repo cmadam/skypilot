@@ -4,11 +4,11 @@ Manages the lifecycle of LSF jobs as virtual instances:
 submit (run_instances) → poll (wait_instances/query_instances) →
 terminate (terminate_instances).
 """
+import base64
 import hashlib
 import logging
 import os
 import shlex
-import tempfile
 import textwrap
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,6 +17,7 @@ from sky import sky_logging
 from sky.utils import status_lib
 from sky.adaptors import lsf as lsf_adaptor
 from sky.provision import common
+from sky.provision import constants as provision_constants
 from sky.provision.lsf import utils as lsf_utils
 from sky.skylet import constants
 from sky.utils import command_runner
@@ -501,11 +502,11 @@ def run_instances(
     region: str,
     cluster_name: str,
     cluster_name_on_cloud: str,
-    config: Dict[str, Any],
+    config: common.ProvisionConfig,
 ) -> common.ProvisionRecord:
     """Submit an LSF job as a virtual instance."""
-    provider_config = config.get('provider_config', {})
-    num_nodes = config.get('count', 1)
+    provider_config = config.provider_config
+    num_nodes = config.count
 
     client = _get_client(provider_config)
     queue = lsf_utils.get_queue_from_config(provider_config)
@@ -555,21 +556,15 @@ def run_instances(
     if rc != 0:
         raise RuntimeError(f'Failed to create script directory: {stderr}')
 
-    # Write script content to remote
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.sh',
-                                     delete=False) as f:
-        f.write(script_content)
-        local_script_path = f.name
-
-    try:
-        runner.rsync(
-            source=local_script_path,
-            target=remote_script_path,
-            up=True,
-            stream_logs=False,
-        )
-    finally:
-        os.unlink(local_script_path)
+    # Write script via pipe (rsync fails on systems with login banners)
+    encoded = base64.b64encode(script_content.encode()).decode()
+    rc, _, stderr = runner.run(
+        f'echo {shlex.quote(encoded)} | base64 -d > '
+        f'{shlex.quote(remote_script_path)} && '
+        f'chmod +x {shlex.quote(remote_script_path)}',
+        require_outputs=True, separate_stderr=True, stream_logs=False)
+    if rc != 0:
+        raise RuntimeError(f'Failed to write provision script: {stderr}')
 
     # Submit job
     job_id = client.submit_job(
@@ -668,6 +663,8 @@ def get_cluster_info(
                 internal_ip=ip,
                 external_ip=ssh_config.get('hostname'),
                 tags={
+                    provision_constants.TAG_SKYPILOT_CLUSTER_NAME:
+                        cluster_name_on_cloud,
                     'job_id': job_id,
                     'node': node,
                     'rank': str(i),
@@ -692,6 +689,7 @@ def query_instances(
     cluster_name_on_cloud: str,
     provider_config: Dict[str, Any],
     non_terminated_only: bool = True,
+    retry_if_missing: bool = False,
 ) -> Dict[str, Optional[Tuple[Optional['status_lib.ClusterStatus'],
                                Optional[str]]]]:
     """Query instance statuses."""
@@ -759,34 +757,94 @@ def terminate_instances(
     logger.info(f'Terminated LSF jobs for {cluster_name_on_cloud}')
 
 
+def cleanup_cluster_resources(
+    cluster_name_on_cloud: str,
+    provider_config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Cleanup cluster resources. No-op for LSF (no auxiliary resources)."""
+    pass
+
+
+def _sky_cluster_home_dir(base_dir: str, cluster_name_on_cloud: str) -> str:
+    """Returns SkyPilot's home directory for this cluster on the LSF node."""
+    return f'{base_dir}/.sky_clusters/{cluster_name_on_cloud}'
+
+
+def _skypilot_runtime_dir(sky_base_dir: str,
+                          cluster_name_on_cloud: str) -> str:
+    """Returns the SkyPilot runtime directory on the LSF cluster.
+
+    Uses the shared workdir (not tmpdir) so it's accessible from login nodes.
+    """
+    return os.path.join(sky_base_dir, '.sky_clusters',
+                        cluster_name_on_cloud)
+
+
 def get_command_runners(
     cluster_info: common.ClusterInfo,
     **credentials: Any,
-) -> List[command_runner.CommandRunner]:
+) -> List[command_runner.LsfCommandRunner]:
     """Get command runners for each instance in the cluster.
 
     For LSF, commands are routed through the login node via SSH.
+    Uses LsfCommandRunner which handles the banned rsync wrapper
+    by specifying --rsync-path to the real rsync binary.
     """
     del credentials  # Use provider_config SSH info instead
 
-    provider_config = cluster_info.provider_config or {}
+    assert cluster_info.provider_config is not None, cluster_info
+    provider_config = cluster_info.provider_config
     ssh_config = provider_config.get('ssh', {})
 
-    runners = []
-    for inst_id, inst_infos in cluster_info.instances.items():
-        if not inst_infos:
-            continue
-        inst_info = inst_infos[0]
+    if cluster_info.head_instance_id is None:
+        return []
 
-        runner = command_runner.SSHCommandRunner(
-            (inst_info.external_ip or ssh_config.get('hostname', ''),
-             inst_info.ssh_port),
-            ssh_user=cluster_info.ssh_user or ssh_config.get('user', ''),
-            ssh_private_key=ssh_config.get('private_key'),
-            ssh_proxy_command=ssh_config.get('proxy_command'),
-            ssh_proxy_jump=ssh_config.get('proxy_jump'),
-        )
-        runners.append(runner)
+    head_instance = cluster_info.get_head_instance()
+    assert head_instance is not None, 'Head instance not found'
+    cluster_name_on_cloud = head_instance.tags.get(
+        provision_constants.TAG_SKYPILOT_CLUSTER_NAME, None)
+    assert cluster_name_on_cloud is not None, cluster_info
+
+    instances = [
+        instance_infos[0] for instance_infos in cluster_info.instances.values()
+    ]
+
+    login_node_ssh_hostname = ssh_config.get('hostname', '')
+    login_node_ssh_port = int(ssh_config.get('port', 22))
+    login_node_ssh_user = ssh_config.get('user', '')
+    login_node_ssh_private_key = ssh_config.get('private_key', None)
+    login_node_ssh_proxy_command = ssh_config.get('proxy_command', None)
+    login_node_ssh_proxy_jump = ssh_config.get('proxy_jump', None)
+
+    ssh_control_name = command_runner.DEFAULT_SSH_CONTROL_NAME
+
+    lsf_cluster_name = provider_config.get('cluster')
+    workdir = lsf_utils.get_workdir(lsf_cluster_name) if lsf_cluster_name else None
+    tmpdir = lsf_utils.get_tmpdir(lsf_cluster_name) if lsf_cluster_name else None
+
+    # Expand $USER in paths
+    if tmpdir and '$USER' in tmpdir:
+        tmpdir = tmpdir.replace('$USER', login_node_ssh_user)
+
+    sky_base_dir = workdir if workdir is not None else f'/home/{login_node_ssh_user}'
+    sky_cluster_home_dir = _sky_cluster_home_dir(sky_base_dir,
+                                                  cluster_name_on_cloud)
+
+    runners = [
+        command_runner.LsfCommandRunner(
+            (instance_info.external_ip or login_node_ssh_hostname,
+             instance_info.ssh_port),
+            login_node_ssh_user,
+            login_node_ssh_private_key,
+            sky_dir=sky_cluster_home_dir,
+            skypilot_runtime_dir=_skypilot_runtime_dir(
+                sky_base_dir, cluster_name_on_cloud),
+            ssh_proxy_command=login_node_ssh_proxy_command,
+            ssh_proxy_jump=login_node_ssh_proxy_jump,
+            ssh_control_name=ssh_control_name,
+            disable_identities_only=True,
+        ) for instance_info in instances
+    ]
 
     return runners
 

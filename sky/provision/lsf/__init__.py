@@ -1,6 +1,7 @@
 """LSF provisioner for SkyPilot."""
 
 from sky.provision.lsf.config import bootstrap_instances
+from sky.provision.lsf.instance import cleanup_cluster_resources
 from sky.provision.lsf.instance import cleanup_ports
 from sky.provision.lsf.instance import get_cluster_info
 from sky.provision.lsf.instance import get_command_runners

@@ -283,15 +283,31 @@ def get_cluster_default_queue(cluster_name: str) -> Optional[str]:
     return client.get_default_queue()
 
 
+_PREFERRED_QUEUE_ORDER = ['normal', 'short', 'interactive', 'priority']
+
+
 def get_queues(cluster_name: str) -> List[str]:
-    """Get all queue names for an LSF cluster."""
+    """Get open queue names for an LSF cluster, ordered by preference.
+
+    The 'normal' queue is preferred over others since it's the standard
+    general-purpose batch queue on most LSF clusters.
+    """
     try:
         client = _create_lsf_client(cluster_name)
     except Exception as e:
         raise ValueError(
             f'Failed to connect to LSF cluster {cluster_name}: '
             f'{common_utils.format_exception(e)}') from e
-    return [q.name for q in client.get_queues()]
+    open_queues = [q.name for q in client.get_queues() if q.is_open]
+
+    def _queue_sort_key(name: str) -> int:
+        try:
+            return _PREFERRED_QUEUE_ORDER.index(name)
+        except ValueError:
+            return len(_PREFERRED_QUEUE_ORDER)
+
+    open_queues.sort(key=_queue_sort_key)
+    return open_queues
 
 
 def check_instance_fits(

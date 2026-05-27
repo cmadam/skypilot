@@ -336,6 +336,7 @@ def _get_cluster_config_template(cloud):
         clouds.IBM: 'ibm-ray.yml.j2',
         clouds.SCP: 'scp-ray.yml.j2',
         clouds.Slurm: 'slurm-ray.yml.j2',
+        clouds.LSF: 'lsf-ray.yml.j2',
         clouds.OCI: 'oci-ray.yml.j2',
         clouds.Paperspace: 'paperspace-ray.yml.j2',
         clouds.PrimeIntellect: 'primeintellect-ray.yml.j2',
@@ -6511,6 +6512,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 slurm_job_id,
                 container_name,
             )
+        elif isinstance(handle.launched_resources.cloud, clouds.LSF):
+            return task_codegen.LsfCodeGen()
         else:
             return task_codegen.RayCodeGen()
 
