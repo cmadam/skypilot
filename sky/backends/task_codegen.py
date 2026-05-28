@@ -1228,14 +1228,30 @@ class LsfCodeGen(TaskCodeGen):
                     log_path = os.path.expanduser(os.path.join({log_dir!r}, 'run.log'))
                     rc_path = os.path.join(dispatch_dir, f'rc_{{seq}}')
                     out_path = os.path.join(dispatch_dir, f'out_{{seq}}.log')
+
+                    # Stream output in real-time while waiting for completion
+                    last_pos = 0
                     while not os.path.exists(rc_path):
+                        if os.path.exists(out_path):
+                            with open(out_path) as f:
+                                f.seek(last_pos)
+                                new_data = f.read()
+                                if new_data:
+                                    print(new_data, end='', flush=True)
+                                    last_pos = f.tell()
                         time.sleep(0.5)
+                    # Flush any remaining output after command completes
+                    if os.path.exists(out_path):
+                        with open(out_path) as f:
+                            f.seek(last_pos)
+                            remaining = f.read()
+                            if remaining:
+                                print(remaining, end='', flush=True)
+
                     with open(rc_path) as f:
                         return_code = int(f.read().strip())
                     os.makedirs(os.path.dirname(log_path), exist_ok=True)
                     shutil.copy(out_path, log_path)
-                    with open(out_path) as f:
-                        print(f.read(), end='', flush=True)
                     returncodes = [return_code]
                 else:
                     returncodes = [0]
