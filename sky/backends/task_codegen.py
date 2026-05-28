@@ -1133,7 +1133,7 @@ class LsfCodeGen(TaskCodeGen):
                     dispatch_dir = {self.container_dispatch_dir!r}
                     seq = 'setup'
                     cmd_path = os.path.join(dispatch_dir, f'cmd_{{seq}}.sh')
-                    env_lines = '\\n'.join(f'export {{k}}={{v}}' for k, v in setup_env.items())
+                    env_lines = '\\n'.join(f'export {{k}}=\"{{v}}\"' for k, v in setup_env.items())
                     with open(cmd_path, 'w') as f:
                         f.write(env_lines + '\\n' + {setup_script!r})
                     rc_path = os.path.join(dispatch_dir, f'rc_{{seq}}')
@@ -1221,7 +1221,7 @@ class LsfCodeGen(TaskCodeGen):
                     dispatch_dir = {self.container_dispatch_dir!r}
                     seq = str(uuid.uuid4())[:8]
                     cmd_path = os.path.join(dispatch_dir, f'cmd_{{seq}}.sh')
-                    env_lines = '\\n'.join(f'export {{k}}={{v}}' for k, v in sky_env_vars_dict.items())
+                    env_lines = '\\n'.join(f'export {{k}}=\"{{v}}\"' for k, v in sky_env_vars_dict.items())
                     with open(cmd_path, 'w') as f:
                         f.write(env_lines + '\\n' + script)
 
@@ -1234,6 +1234,8 @@ class LsfCodeGen(TaskCodeGen):
                         return_code = int(f.read().strip())
                     os.makedirs(os.path.dirname(log_path), exist_ok=True)
                     shutil.copy(out_path, log_path)
+                    with open(out_path) as f:
+                        print(f.read(), end='', flush=True)
                     returncodes = [return_code]
                 else:
                     returncodes = [0]
