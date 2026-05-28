@@ -100,6 +100,7 @@ def _build_enroot_block(image_id: str, container_name: str,
                         enroot_config: Dict[str, Any],
                         env_vars: Dict[str, str],
                         mounts: List[str],
+                        dispatch_dir: str,
                         is_multinode: bool = False) -> str:
     """Build the full enroot setup block with BlueVela workarounds.
 
@@ -159,169 +160,204 @@ def _build_enroot_block(image_id: str, container_name: str,
     for m in mounts:
         mount_lines += f'    echo "{m}"\n'
 
-    block = textwrap.dedent(f"""\
-        # === Enroot container setup ===
+    block = f"""\
+# === Enroot container setup ===
 
-        # ── BlueVela workarounds ──────────────────────────────────────────────
-        BV_WRAPPER_DIR=$(mktemp -d -t bv-enroot-wrappers.XXXXXX)
-        export PATH="${{BV_WRAPPER_DIR}}:${{PATH}}"
+# ── BlueVela workarounds ──────────────────────────────────────────────
+BV_WRAPPER_DIR=$(mktemp -d -t bv-enroot-wrappers.XXXXXX)
+export PATH="${{BV_WRAPPER_DIR}}:${{PATH}}"
 
-        if ! command -v fusermount &>/dev/null && command -v fusermount3 &>/dev/null; then
-            ln -sf "$(command -v fusermount3)" "${{BV_WRAPPER_DIR}}/fusermount"
-        fi
+if ! command -v fusermount &>/dev/null && command -v fusermount3 &>/dev/null; then
+    ln -sf "$(command -v fusermount3)" "${{BV_WRAPPER_DIR}}/fusermount"
+fi
 
-        printf '#!/bin/bash\\n/usr/bin/enroot-aufs2ovlfs "$@" || true\\n' \\
-            > "${{BV_WRAPPER_DIR}}/enroot-aufs2ovlfs"
-        chmod +x "${{BV_WRAPPER_DIR}}/enroot-aufs2ovlfs"
+printf '#!/bin/bash\\n/usr/bin/enroot-aufs2ovlfs "$@" || true\\n' \\
+    > "${{BV_WRAPPER_DIR}}/enroot-aufs2ovlfs"
+chmod +x "${{BV_WRAPPER_DIR}}/enroot-aufs2ovlfs"
 
-        cat > "${{BV_WRAPPER_DIR}}/enroot-mksquashovlfs" << 'WRAPPER'
-        #!/bin/bash
-        LAYERS="$1"; OUTFILE="$2"; shift 2
-        /usr/bin/enroot-mksquashovlfs "$LAYERS" "$OUTFILE" "$@" 2>/dev/null
-        if [ $? -eq 0 ] && [ -f "$OUTFILE" ]; then exit 0; fi
-        IFS=':' read -ra LAYER_DIRS <<< "$LAYERS"
-        mksquashfs "${{LAYER_DIRS[@]}}" "$OUTFILE" "$@" -no-xattrs
-        WRAPPER
-        chmod +x "${{BV_WRAPPER_DIR}}/enroot-mksquashovlfs"
+cat > "${{BV_WRAPPER_DIR}}/enroot-mksquashovlfs" << 'WRAPPER'
+#!/bin/bash
+LAYERS="$1"; OUTFILE="$2"; shift 2
+/usr/bin/enroot-mksquashovlfs "$LAYERS" "$OUTFILE" "$@" 2>/dev/null
+if [ $? -eq 0 ] && [ -f "$OUTFILE" ]; then exit 0; fi
+IFS=':' read -ra LAYER_DIRS <<< "$LAYERS"
+mksquashfs "${{LAYER_DIRS[@]}}" "$OUTFILE" "$@" -no-xattrs
+WRAPPER
+chmod +x "${{BV_WRAPPER_DIR}}/enroot-mksquashovlfs"
 
-        # ── Enroot path setup ─────────────────────────────────────────────────
-        export ENROOT_DATA_PATH="{enroot_data_path}"
-        export ENROOT_CACHE_PATH="{share_path}/user-$(id -u)/enroot-cache"
-        export ENROOT_SQUASH_OPTIONS='{squash_options}'
-        export ENROOT_MOUNT_HOME=false
-        export ENROOT_RUNTIME_PATH="/tmp/user-$(id -u)/enroot-runtime"
-        export ENROOT_TEMP_PATH="/tmp/user-$(id -u)/enroot-tmp"
-        export XDG_RUNTIME_DIR="/tmp/user-$(id -u)/xdg-runtime"
+# ── Enroot path setup ─────────────────────────────────────────────────
+export ENROOT_DATA_PATH="{enroot_data_path}"
+export ENROOT_CACHE_PATH="{share_path}/user-$(id -u)/enroot-cache"
+export ENROOT_SQUASH_OPTIONS='{squash_options}'
+export ENROOT_MOUNT_HOME=false
+export ENROOT_RUNTIME_PATH="/tmp/user-$(id -u)/enroot-runtime"
+export ENROOT_TEMP_PATH="/tmp/user-$(id -u)/enroot-tmp"
+export XDG_RUNTIME_DIR="/tmp/user-$(id -u)/xdg-runtime"
 
-        mkdir -p "$ENROOT_DATA_PATH" "$ENROOT_CACHE_PATH" \\
-                 "$ENROOT_RUNTIME_PATH" "$ENROOT_TEMP_PATH" "$XDG_RUNTIME_DIR"
+mkdir -p "$ENROOT_DATA_PATH" "$ENROOT_CACHE_PATH" \\
+         "$ENROOT_RUNTIME_PATH" "$ENROOT_TEMP_PATH" "$XDG_RUNTIME_DIR"
 
-        SQSH_FILE="{sqsh_file}"
-        CONTAINER_NAME="{container_name_safe}"
-        mkdir -p "$(dirname "$SQSH_FILE")"
+SQSH_FILE="{sqsh_file}"
+CONTAINER_NAME="{container_name_safe}"
+mkdir -p "$(dirname "$SQSH_FILE")"
 
-        # ── Helper: flatten layered sqsh ──────────────────────────────────────
-        flatten_sqsh_if_needed() {{
-            local sqsh_file="$1"
-            local mount_dir="/tmp/user-$(id -u)/sqsh-check"
-            mkdir -p "$mount_dir"
-            squashfuse "$sqsh_file" "$mount_dir" 2>/dev/null || return 0
-            local is_layered=0
-            if [[ -d "$mount_dir/0" ]] && [[ ! -d "$mount_dir/bin" ]]; then
-                is_layered=1
-            fi
-            fusermount3 -u "$mount_dir" 2>/dev/null || fusermount -u "$mount_dir" 2>/dev/null || true
+# ── Helper: flatten layered sqsh ──────────────────────────────────────
+flatten_sqsh_if_needed() {{
+    local sqsh_file="$1"
+    local mount_dir="/tmp/user-$(id -u)/sqsh-check"
+    mkdir -p "$mount_dir"
+    squashfuse "$sqsh_file" "$mount_dir" 2>/dev/null || return 0
+    local is_layered=0
+    if [[ -d "$mount_dir/0" ]] && [[ ! -d "$mount_dir/bin" ]]; then
+        is_layered=1
+    fi
+    fusermount3 -u "$mount_dir" 2>/dev/null || fusermount -u "$mount_dir" 2>/dev/null || true
 
-            if [[ $is_layered -eq 0 ]]; then
-                echo "[$(date)] Sqsh is already flat"
-                return 0
-            fi
+    if [[ $is_layered -eq 0 ]]; then
+        echo "[$(date)] Sqsh is already flat"
+        return 0
+    fi
 
-            echo "[$(date)] Sqsh has layered OCI structure, flattening..."
-            local work_dir="/opt/nvme/$USER/flatten-work"
-            local local_flat="/opt/nvme/$USER/$(basename "$sqsh_file" .sqsh)-flat.sqsh"
-            rm -rf "$work_dir" "$local_flat"
-            mkdir -p "$work_dir"/{{layers,merged,upper,work}}
+    echo "[$(date)] Sqsh has layered OCI structure, flattening..."
+    local work_dir="/opt/nvme/$USER/flatten-work"
+    local local_flat="/opt/nvme/$USER/$(basename "$sqsh_file" .sqsh)-flat.sqsh"
+    rm -rf "$work_dir" "$local_flat"
+    mkdir -p "$work_dir"/{{layers,merged,upper,work}}
 
-            squashfuse "$sqsh_file" "$work_dir/layers"
-            local lowerdir
-            lowerdir=$(ls -d "$work_dir/layers"/*/ | sort -t/ -k7 -n -r | tr '\\n' ':' | sed 's/:$//')
-            fuse-overlayfs -o "lowerdir=${{lowerdir}},upperdir=$work_dir/upper,workdir=$work_dir/work" "$work_dir/merged"
+    squashfuse "$sqsh_file" "$work_dir/layers"
+    local lowerdir
+    lowerdir=$(ls -d "$work_dir/layers"/*/ | sort -t/ -k7 -n -r | tr '\\n' ':' | sed 's/:$//')
+    fuse-overlayfs -o "lowerdir=${{lowerdir}},upperdir=$work_dir/upper,workdir=$work_dir/work" "$work_dir/merged"
 
-            echo "[$(date)] Creating flat sqsh on local NVME..."
-            mksquashfs "$work_dir/merged" "$local_flat" -comp lz4 -Xhc -noappend >/dev/null 2>&1
+    echo "[$(date)] Creating flat sqsh on local NVME..."
+    mksquashfs "$work_dir/merged" "$local_flat" -comp lz4 -Xhc -noappend >/dev/null 2>&1
 
-            echo "[$(date)] Copying flat sqsh to shared filesystem..."
-            cp "$local_flat" "$sqsh_file"
-            chmod g+rw "$sqsh_file" 2>/dev/null || true
-            echo "[$(date)] Flatten complete: $(du -h "$sqsh_file" | cut -f1)"
+    echo "[$(date)] Copying flat sqsh to shared filesystem..."
+    cp "$local_flat" "$sqsh_file"
+    chmod g+rw "$sqsh_file" 2>/dev/null || true
+    echo "[$(date)] Flatten complete: $(du -h "$sqsh_file" | cut -f1)"
 
-            fusermount3 -u "$work_dir/merged" 2>/dev/null || true
-            fusermount3 -u "$work_dir/layers" 2>/dev/null || true
-            rm -rf "$work_dir" "$local_flat"
-        }}
+    fusermount3 -u "$work_dir/merged" 2>/dev/null || true
+    fusermount3 -u "$work_dir/layers" 2>/dev/null || true
+    rm -rf "$work_dir" "$local_flat"
+}}
 
-        # ── Step 1: Import + Flatten (master only for multi-node) ─────────────
-        # Uses flock to prevent concurrent imports of the same image by
-        # multiple jobs. Only one job proceeds with import; others wait.
-        if [[ "${{BV_WORKER}}" != "1" ]]; then
-            LOCK_FILE="${{SQSH_FILE}}.lock"
-            (
-                flock -x 200
-                if [[ -f "$SQSH_FILE" ]]; then
-                    echo "[$(date)] Squash file exists: $SQSH_FILE ($(du -h "$SQSH_FILE" | cut -f1)), skipping import"
+# ── Step 1: Import + Flatten (master only for multi-node) ─────────────
+# Uses flock to prevent concurrent imports of the same image by
+# multiple jobs. Only one job proceeds with import; others wait.
+if [[ "${{BV_WORKER}}" != "1" ]]; then
+    LOCK_FILE="${{SQSH_FILE}}.lock"
+    (
+        flock -x 200
+        if [[ -f "$SQSH_FILE" ]]; then
+            echo "[$(date)] Squash file exists: $SQSH_FILE ($(du -h "$SQSH_FILE" | cut -f1)), skipping import"
+        else
+            echo "[$(date)] Importing docker://{enroot_uri} → $SQSH_FILE"
+            if ! enroot import -o "$SQSH_FILE" "docker://{enroot_uri}"; then
+                if [[ -f "$SQSH_FILE" ]] && [[ -s "$SQSH_FILE" ]]; then
+                    echo "[$(date)] Import completed with warnings (sqsh file was created)"
                 else
-                    echo "[$(date)] Importing docker://{enroot_uri} → $SQSH_FILE"
-                    if ! enroot import -o "$SQSH_FILE" "docker://{enroot_uri}"; then
-                        if [[ -f "$SQSH_FILE" ]] && [[ -s "$SQSH_FILE" ]]; then
-                            echo "[$(date)] Import completed with warnings (sqsh file was created)"
-                        else
-                            echo "ERROR: enroot import failed for {image_id}"
-                            exit 1
-                        fi
-                    fi
-                    chmod g+rw "$SQSH_FILE" 2>/dev/null || true
-                    echo "[$(date)] Import complete: $(du -h "$SQSH_FILE" | cut -f1)"
-                    flatten_sqsh_if_needed "$SQSH_FILE"
+                    echo "ERROR: enroot import failed for {image_id}"
+                    exit 1
                 fi
-            ) 200>"$LOCK_FILE"
+            fi
+            chmod g+rw "$SQSH_FILE" 2>/dev/null || true
+            echo "[$(date)] Import complete: $(du -h "$SQSH_FILE" | cut -f1)"
+            flatten_sqsh_if_needed "$SQSH_FILE"
         fi
-        {_build_blaunch_dispatch(share_path, is_multinode)}
-        # ── NVME pre-flight check ─────────────────────────────────────────────
-        NVME_USAGE=$(df /opt/nvme 2>/dev/null | awk 'NR==2 {{print $5}}' | sed 's/%//')
-        if [[ -n "$NVME_USAGE" && $NVME_USAGE -gt 85 ]]; then
-            echo "[$(date)] WARNING: /opt/nvme is ${{NVME_USAGE}}% full"
-        fi
+    ) 200>"$LOCK_FILE"
+fi
+{_build_blaunch_dispatch(share_path, is_multinode)}
+# ── NVME pre-flight check ─────────────────────────────────────────────
+NVME_USAGE=$(df /opt/nvme 2>/dev/null | awk 'NR==2 {{print $5}}' | sed 's/%//')
+if [[ -n "$NVME_USAGE" && $NVME_USAGE -gt 85 ]]; then
+    echo "[$(date)] WARNING: /opt/nvme is ${{NVME_USAGE}}% full"
+fi
 
-        # ── Step 2: Create container (per-node) ───────────────────────────────
-        echo "[$(date)] Creating container '$CONTAINER_NAME' from $SQSH_FILE"
-        enroot create -f -n "$CONTAINER_NAME" "$SQSH_FILE" || {{
-            echo "ERROR: enroot create failed"
-            exit 1
-        }}
-        chmod -R a+rw "$ENROOT_DATA_PATH/$CONTAINER_NAME" 2>/dev/null || true
+# ── Step 2: Create container (per-node) ───────────────────────────────
+echo "[$(date)] Creating container '$CONTAINER_NAME' from $SQSH_FILE"
+enroot create -f -n "$CONTAINER_NAME" "$SQSH_FILE" || {{
+    echo "ERROR: enroot create failed"
+    exit 1
+}}
+chmod -R a+rw "$ENROOT_DATA_PATH/$CONTAINER_NAME" 2>/dev/null || true
 
-        # Kill catatonit orphans spawned by THIS container's create only.
-        # Scoped to children of this shell to avoid killing other jobs'
-        # catatonit processes (which would destroy their containers).
-        pkill -9 -P $$ -x catatonit 2>/dev/null || true
+# Kill catatonit orphans spawned by THIS container's create only.
+# Scoped to children of this shell to avoid killing other jobs'
+# catatonit processes (which would destroy their containers).
+pkill -9 -P $$ -x catatonit 2>/dev/null || true
 
-        # Replace entrypoint with passthrough
-        CONTAINER_RC="$ENROOT_DATA_PATH/$CONTAINER_NAME/etc/rc"
-        if [[ -f "$CONTAINER_RC" ]]; then
-            printf '#!/bin/sh\\nexec "$@"\\n' > "$CONTAINER_RC"
-        fi
+# Replace entrypoint with passthrough
+CONTAINER_RC="$ENROOT_DATA_PATH/$CONTAINER_NAME/etc/rc"
+if [[ -f "$CONTAINER_RC" ]]; then
+    printf '#!/bin/sh\\nexec "$@"\\n' > "$CONTAINER_RC"
+fi
 
-        # Validate container filesystem
-        CONTAINER_SHELL="$ENROOT_DATA_PATH/$CONTAINER_NAME/bin/sh"
-        if [[ ! -f "$CONTAINER_SHELL" ]]; then
-            echo "[$(date)] ERROR: Container filesystem incomplete (missing /bin/sh)"
-            enroot remove -f "$CONTAINER_NAME" 2>/dev/null || true
-            rm -rf "$ENROOT_DATA_PATH/$CONTAINER_NAME" 2>/dev/null || true
-            exit 1
-        fi
+# Validate container filesystem
+CONTAINER_SHELL="$ENROOT_DATA_PATH/$CONTAINER_NAME/bin/sh"
+if [[ ! -f "$CONTAINER_SHELL" ]]; then
+    echo "[$(date)] ERROR: Container filesystem incomplete (missing /bin/sh)"
+    enroot remove -f "$CONTAINER_NAME" 2>/dev/null || true
+    rm -rf "$ENROOT_DATA_PATH/$CONTAINER_NAME" 2>/dev/null || true
+    exit 1
+fi
 
-        # ── Step 3: Generate enroot config and start ──────────────────────────
-        ENROOT_CONFIG_FILE=$(mktemp -t enroot.config.XXXXXX)
-        # Static part (quoted heredoc — no shell expansion)
-        cat > "$ENROOT_CONFIG_FILE" << 'ENROOT_CFG_STATIC'
-        environ() {{
-            env
-        {static_env_lines}ENROOT_CFG_STATIC
-        # Dynamic part (unquoted heredoc — RANK/WORLD_SIZE expand now)
-        cat >> "$ENROOT_CONFIG_FILE" << ENROOT_CFG_DYNAMIC
-        {dynamic_env_lines}}}
-        mounts() {{
-        {mount_lines}}}
-        ENROOT_CFG_DYNAMIC
+# ── Step 3: Generate enroot config and start ──────────────────────────
+ENROOT_CONFIG_FILE=$(mktemp -t enroot.config.XXXXXX)
+# Static part (quoted heredoc — no shell expansion)
+cat > "$ENROOT_CONFIG_FILE" << 'ENROOT_CFG_STATIC'
+environ() {{
+    env | grep -v '^PATH=\\|^HOME=\\|^LANG=\\|^HOSTNAME='
+    echo "HOME=/"
+    echo "PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+{static_env_lines}ENROOT_CFG_STATIC
+# Dynamic part (unquoted heredoc — RANK/WORLD_SIZE expand now)
+cat >> "$ENROOT_CONFIG_FILE" << ENROOT_CFG_DYNAMIC
+{dynamic_env_lines}}}
+mounts() {{
+{mount_lines}}}
+ENROOT_CFG_DYNAMIC
 
-        echo "[$(date)] Starting container: enroot start --conf $ENROOT_CONFIG_FILE --rw $CONTAINER_NAME"
-        enroot start --conf "$ENROOT_CONFIG_FILE" --rw "$CONTAINER_NAME" \\
-            sleep infinity &
-        ENROOT_PID=$!
-        sleep 2
-        echo "[$(date)] Enroot container started (PID=$ENROOT_PID)"
-    """)
+# ── Step 4: Command dispatcher ─────────────────────────────────────────
+DISPATCH_DIR="{dispatch_dir}"
+rm -rf "$DISPATCH_DIR"
+mkdir -p "$DISPATCH_DIR"
+cat > "$DISPATCH_DIR/dispatcher.sh" << 'DISPATCH_EOF'
+#!/bin/bash
+DDIR="$1"
+touch "$DDIR/.ready"
+while true; do
+    for cmd_file in "$DDIR"/cmd_*.sh; do
+        [ -f "$cmd_file" ] || continue
+        seq="${{cmd_file##*/cmd_}}"; seq="${{seq%.sh}}"
+        /bin/bash "$cmd_file" > "$DDIR/out_${{seq}}.log" 2>&1
+        echo $? > "$DDIR/rc_${{seq}}"
+        mv "$cmd_file" "$DDIR/done_${{seq}}.sh"
+    done
+    [ -f "$DDIR/.shutdown" ] && break
+    sleep 0.5
+done
+DISPATCH_EOF
+chmod +x "$DISPATCH_DIR/dispatcher.sh"
+
+echo "[$(date)] Starting container with command dispatcher"
+enroot start --conf "$ENROOT_CONFIG_FILE" --rw "$CONTAINER_NAME" \\
+    bash "$DISPATCH_DIR/dispatcher.sh" "$DISPATCH_DIR" &
+ENROOT_PID=$!
+
+# Wait for container to signal readiness
+echo "[$(date)] Waiting for container dispatcher to be ready..."
+READY_WAIT=0
+while [ ! -f "$DISPATCH_DIR/.ready" ]; do
+    sleep 0.5
+    READY_WAIT=$((READY_WAIT + 1))
+    if [ $READY_WAIT -gt 120 ]; then
+        echo "ERROR: Container dispatcher did not become ready in 60s"
+        exit 1
+    fi
+done
+echo "[$(date)] Enroot container ready (PID=$ENROOT_PID), dispatch_dir=$DISPATCH_DIR"
+"""
     return block
 
 
@@ -393,6 +429,7 @@ def _build_bsub_script(
         nccl_block = f'[ -f "{nccl_tuning}" ] && source "{nccl_tuning}"'
 
     # Container block
+    dispatch_dir = f'{sky_cluster_home}/.sky/dispatch'
     container_block = ''
     if image_id and enroot_enabled:
         enroot_config = {
@@ -409,6 +446,7 @@ def _build_bsub_script(
             enroot_config=enroot_config,
             env_vars={},
             mounts=[],
+            dispatch_dir=dispatch_dir,
             is_multinode=(num_nodes > 1),
         )
 
@@ -457,7 +495,9 @@ def _build_bsub_script(
             local exit_code=$?
             set +e
             echo "[$(date)] Cleaning up SkyPilot LSF instance..."
-            # Kill background processes (enroot sleep infinity, etc.)
+            # Signal dispatcher to shut down gracefully
+            [ -d "{dispatch_dir}" ] && touch "{dispatch_dir}/.shutdown"
+            # Kill background processes (enroot dispatcher, etc.)
             kill $(jobs -p) 2>/dev/null || true
             # Kill catatonit orphans (scoped to this job's process tree)
             pkill -9 -P $$ -x catatonit 2>/dev/null || true
@@ -477,6 +517,9 @@ def _build_bsub_script(
         mkdir -p "{sky_cluster_home}/sky_logs" "{sky_cluster_home}/.sky"
         mkdir -p "{tmpdir}"
 
+        # Remove stale ready signal from previous runs
+        rm -f "{ready_signal}"
+
         # Write marker file
         touch "{marker_file}"
 
@@ -491,7 +534,13 @@ def _build_bsub_script(
         echo "SkyPilot LSF instance ready: {cluster_name_on_cloud}"
 
         # Keep job alive until terminated
-        sleep infinity
+        if [[ -n "${{ENROOT_PID:-}}" ]]; then
+            # Container mode: wait for dispatcher to exit (or be killed)
+            wait $ENROOT_PID
+        else
+            # Bare-metal mode: sleep forever
+            sleep infinity
+        fi
     """)
 
     return script
@@ -566,6 +615,13 @@ def run_instances(
     if rc != 0:
         raise RuntimeError(f'Failed to write provision script: {stderr}')
 
+    # Remove stale ready signal before submitting (prevents race with
+    # _wait_for_ready_signal finding a leftover file from a previous run)
+    sky_cluster_home = f'{workdir}/{cluster_name_on_cloud}'
+    ready_file = f'{sky_cluster_home}/.sky_ready'
+    runner.run(f'rm -f {shlex.quote(ready_file)}',
+               require_outputs=True, separate_stderr=True, stream_logs=False)
+
     # Submit job
     job_id = client.submit_job(
         queue=queue,
@@ -577,6 +633,12 @@ def run_instances(
     # Wait for job to get nodes allocated
     nodes = _wait_for_job_nodes(client, job_id, cluster_name_on_cloud)
     instance_ids = [lsf_utils.instance_id(job_id, n) for n in nodes]
+
+    # Wait for bsub script to signal readiness (includes container setup)
+    image_id = provider_config.get('image_id', '')
+    enroot_enabled = provider_config.get('enroot_enabled', 'False') == 'True'
+    if image_id and enroot_enabled:
+        _wait_for_ready_signal(runner, ready_file, cluster_name_on_cloud)
 
     return common.ProvisionRecord(
         provider_name='lsf',
@@ -618,6 +680,24 @@ def _wait_for_job_nodes(client: lsf_adaptor.LsfClient,
     raise TimeoutError(
         f'Timed out waiting for LSF job {job_id} ({cluster_name}) '
         f'to get nodes allocated after {timeout}s.')
+
+
+def _wait_for_ready_signal(runner, ready_file: str, cluster_name: str,
+                           timeout: int = 600) -> None:
+    """Wait for the bsub script to signal readiness via a file on shared FS."""
+    logger.info(f'Waiting for container readiness: {ready_file}')
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        rc, _, _ = runner.run(
+            f'test -f {shlex.quote(ready_file)}',
+            require_outputs=True, separate_stderr=True, stream_logs=False)
+        if rc == 0:
+            logger.info(f'Container ready for {cluster_name}')
+            return
+        time.sleep(_POLL_INTERVAL)
+    raise TimeoutError(
+        f'Timed out waiting for container readiness for {cluster_name} '
+        f'after {timeout}s. File not found: {ready_file}')
 
 
 def wait_instances(

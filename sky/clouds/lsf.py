@@ -375,7 +375,8 @@ class LSF(clouds.Cloud):
             'lsf_proxy_jump': ssh_config_dict.get('proxyjump', ''),
             'lsf_identities_only': str(
                 lsf_utils.get_identities_only(ssh_config_dict)),
-            'image_id': resources.image_id or '',
+            'image_id': (list(resources.image_id.values())[0]
+                        if resources.image_id else ''),
             'bsub_options': bsub_options,
             'enroot_enabled': str(enroot_config['enabled']),
             'enroot_share_path': enroot_config['share_path'],

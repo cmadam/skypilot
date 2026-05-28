@@ -6513,7 +6513,23 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 container_name,
             )
         elif isinstance(handle.launched_resources.cloud, clouds.LSF):
-            return task_codegen.LsfCodeGen()
+            dispatch_dir = None
+            container_image = (
+                list(handle.launched_resources.image_id.values())[0]
+                if handle.launched_resources.image_id else None)
+            if container_image is not None:
+                assert (handle.cached_cluster_info
+                        is not None), ('cached_cluster_info must be set')
+                provider_config = (
+                    handle.cached_cluster_info.provider_config)
+                workdir = provider_config.get('workdir', '')
+                if not workdir:
+                    workdir = '~/sky_workdir'
+                dispatch_dir = (f'{workdir}/'
+                                f'{handle.cluster_name_on_cloud}/'
+                                f'.sky/dispatch')
+            return task_codegen.LsfCodeGen(
+                container_dispatch_dir=dispatch_dir)
         else:
             return task_codegen.RayCodeGen()
 
