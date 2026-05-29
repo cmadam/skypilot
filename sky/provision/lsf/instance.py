@@ -119,6 +119,13 @@ def _build_enroot_block(image_id: str, container_name: str,
                                        '-comp lz4 -Xhc -no-xattrs')
     use_nvme = enroot_config.get('use_local_nvme', False)
 
+    # Strip the docker:// scheme so downstream callers (sqsh filename,
+    # enroot URI conversion, and the `docker://` prefix added in the bsub
+    # script) don't end up with `docker://docker://...` or filenames
+    # starting with `docker---`.
+    if image_id.startswith('docker://'):
+        image_id = image_id[len('docker://'):]
+
     enroot_uri = _convert_to_enroot_uri(image_id)
     # Container name is job-specific (prevents concurrent job interference)
     container_name_safe = container_name.replace('/', '-').replace(':', '-')
