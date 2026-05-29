@@ -7,6 +7,9 @@
 resources:
   cloud: lsf
   accelerators: H100:8
+  # Match gbansible bluevela_openinstruct_sft_job default bv_memory=1.5T (per-host
+  # via #BSUB -hl). Provisioner emits `#BSUB -M {memory}G`, so 1536 GB ≈ 1.5 TB.
+  memory: 1536
   image_id: docker://us.icr.io/cil15-shared-registry/open-instruct-tuning:0.1.0-conda
 
 run: |
