@@ -27,7 +27,7 @@ from sky.utils import timeline
 logger = sky_logging.init_logger(__name__)
 
 # How long to wait for a job to get allocated (seconds)
-_DEFAULT_PROVISION_TIMEOUT = 600
+_DEFAULT_PROVISION_TIMEOUT = 1800
 _POLL_INTERVAL = 5
 
 
@@ -101,7 +101,8 @@ def _build_enroot_block(image_id: str, container_name: str,
                         env_vars: Dict[str, str],
                         mounts: List[str],
                         dispatch_dir: str,
-                        is_multinode: bool = False) -> str:
+                        is_multinode: bool = False,
+                        inject_topology: bool = True) -> str:
     """Build the full enroot setup block with BlueVela workarounds.
 
     Container isolation strategy (per gbansible guidelines):
@@ -110,9 +111,9 @@ def _build_enroot_block(image_id: str, container_name: str,
     - Container name: derived from JOB NAME (cluster_name_on_cloud),
       unique per job — prevents concurrent jobs from destroying each
       other's containers via enroot create -f or enroot remove -f
-    - Distributed env vars (RANK, WORLD_SIZE, etc.): only injected for
-      multi-node jobs; unset for single-node to prevent PyTorch DTensor
-      initialization errors in eval/inference workloads
+    - inject_topology: when True, passes NUM_GPUS_PER_NODE, WORLD_SIZE,
+      RANK, MASTER_ADDR, MASTER_PORT, and LSF job vars into the container
+      so training scripts can derive distributed config
     """
     share_path = enroot_config.get('share_path', '/tmp')
     squash_options = enroot_config.get('squash_options',
@@ -146,17 +147,19 @@ def _build_enroot_block(image_id: str, container_name: str,
         static_env_lines += f'    echo "{key}={val}"\n'
 
     # Dynamic env lines (written via unquoted heredoc — vars expand at
-    # config-write time). Only for multi-node: single-node eval/inference
-    # must NOT have RANK/WORLD_SIZE set — their presence triggers PyTorch
-    # DTensor initialization, causing "mixed Tensor/DTensor" errors.
+    # config-write time from the topology_block shell vars).
     dynamic_env_lines = ''
-    if is_multinode:
+    if inject_topology:
         dynamic_env_lines = (
+            '    echo "NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE}"\n'
+            '    echo "TOTAL_NODES=${TOTAL_NODES}"\n'
             '    echo "RANK=${RANK}"\n'
             '    echo "WORLD_SIZE=${WORLD_SIZE}"\n'
             '    echo "LOCAL_RANK=${LOCAL_RANK}"\n'
             '    echo "MASTER_ADDR=${MASTER_HOST}"\n'
             '    echo "MASTER_PORT=${MASTER_PORT:-29500}"\n'
+            '    echo "LSB_JOBID=${LSB_JOBID:-}"\n'
+            '    echo "LSB_HOSTS=${LSB_HOSTS:-$(hostname)}"\n'
         )
 
     # Build mount lines for enroot config
@@ -316,7 +319,7 @@ cat > "$ENROOT_CONFIG_FILE" << 'ENROOT_CFG_STATIC'
 environ() {{
     env | grep -v '^PATH=\\|^HOME=\\|^LANG=\\|^HOSTNAME='
     echo "HOME=/"
-    echo "PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    echo "PATH=/opt/miniconda3/bin:/opt/miniconda3/condabin:/opt/conda/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 {static_env_lines}ENROOT_CFG_STATIC
 # Dynamic part (unquoted heredoc — RANK/WORLD_SIZE expand now)
 cat >> "$ENROOT_CONFIG_FILE" << ENROOT_CFG_DYNAMIC
@@ -455,37 +458,44 @@ def _build_bsub_script(
             mounts=[],
             dispatch_dir=dispatch_dir,
             is_multinode=(num_nodes > 1),
+            inject_topology=True,
         )
 
-    # Multi-node topology setup (just detection; blaunch is in the enroot block)
-    multinode_block = ''
-    if num_nodes > 1:
-        multinode_block = textwrap.dedent("""\
-            # === Multi-node topology ===
+    # Topology setup — always compute for container jobs (training scripts
+    # like run_dense_enroot.sh need NUM_GPUS_PER_NODE, WORLD_SIZE, etc.)
+    topology_block = ''
+    if image_id and enroot_enabled:
+        rank_detection = ''
+        if num_nodes > 1:
+            rank_detection = textwrap.dedent("""\
+                # Deduplicate while preserving order (first host = rank 0 = master)
+                UNIQUE_HOSTS=($(echo "$LSB_HOSTS" | tr ' ' '\\n' | awk '!seen[$0]++'))
+                if [[ -n "$LSB_HOSTS" ]]; then
+                    for i in "${!UNIQUE_HOSTS[@]}"; do
+                        if [[ "${UNIQUE_HOSTS[$i]}" == "$LOCAL_HOST" ]]; then
+                            RANK=$i
+                            break
+                        fi
+                    done
+                fi
+            """)
+        topology_block = textwrap.dedent("""\
+            # === Compute topology ===
             NUM_GPUS_PER_NODE=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
-            TOTAL_NODES=$(echo "${LSB_HOSTS:-$(hostname)}" | tr ' ' '\\n' | sort -u | wc -l)
+            TOTAL_NODES=$(echo "${{LSB_HOSTS:-$(hostname)}}" | tr ' ' '\\n' | sort -u | wc -l)
             LOCAL_HOST=$(hostname -s)
-            MASTER_HOST=$(echo "${LSB_HOSTS:-$(hostname -s)}" | awk '{print $1}')
+            MASTER_HOST=$(echo "${{LSB_HOSTS:-$(hostname -s)}}" | awk '{{print $1}}')
+            MASTER_PORT=$((29500 + (${{LSB_JOBID:-0}} % 1000)))
 
-            # Deduplicate while preserving order (first host = rank 0 = master)
-            UNIQUE_HOSTS=($(echo "$LSB_HOSTS" | tr ' ' '\\n' | awk '!seen[$0]++'))
             RANK=0
-            if [[ -n "$LSB_HOSTS" ]]; then
-                for i in "${!UNIQUE_HOSTS[@]}"; do
-                    if [[ "${UNIQUE_HOSTS[$i]}" == "$LOCAL_HOST" ]]; then
-                        RANK=$i
-                        break
-                    fi
-                done
-            fi
             WORLD_SIZE=$TOTAL_NODES
             LOCAL_RANK=0
-
+            {rank_detection}
             export MASTER_ADDR="$MASTER_HOST"
-            export MASTER_PORT=29500
-            export RANK WORLD_SIZE LOCAL_RANK
-            echo "[$(date)] Topology: node=$LOCAL_HOST rank=$RANK/$WORLD_SIZE gpus=$NUM_GPUS_PER_NODE master=$MASTER_HOST"
-        """)
+            export MASTER_PORT RANK WORLD_SIZE LOCAL_RANK
+            export NUM_GPUS_PER_NODE TOTAL_NODES
+            echo "[$(date)] Topology: node=$LOCAL_HOST rank=$RANK/$WORLD_SIZE gpus=$NUM_GPUS_PER_NODE master=$MASTER_HOST:$MASTER_PORT"
+        """).format(rank_detection=rank_detection)
 
     # Marker file and ready signal
     marker_file = f'{sky_cluster_home}/{lsf_utils.LSF_MARKER_FILE}'
@@ -532,7 +542,7 @@ def _build_bsub_script(
 
         {nccl_block}
 
-        {multinode_block}
+        {topology_block}
 
         {container_block}
 
