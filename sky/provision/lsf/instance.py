@@ -927,6 +927,14 @@ def get_command_runners(
     sky_cluster_home_dir = _sky_cluster_home_dir(sky_base_dir,
                                                   cluster_name_on_cloud)
 
+    # Enable dispatch mode when container is active — routes commands
+    # to the compute node via the shared-FS dispatcher in the container.
+    image_id = provider_config.get('image_id')
+    enroot_enabled = provider_config.get('enroot', {}).get('enabled', False)
+    dispatch_dir = None
+    if image_id and enroot_enabled:
+        dispatch_dir = f'{sky_cluster_home_dir}/.sky/dispatch'
+
     runners = [
         command_runner.LsfCommandRunner(
             (instance_info.external_ip or login_node_ssh_hostname,
@@ -940,6 +948,7 @@ def get_command_runners(
             ssh_proxy_jump=login_node_ssh_proxy_jump,
             ssh_control_name=ssh_control_name,
             disable_identities_only=True,
+            dispatch_dir=dispatch_dir,
         ) for instance_info in instances
     ]
 

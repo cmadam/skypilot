@@ -1800,12 +1800,14 @@ class LsfCommandRunner(SSHCommandRunner):
         sky_dir: str,
         skypilot_runtime_dir: str,
         remote_rsync_path: str = '/usr/bin/rsync',
+        dispatch_dir: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(node, ssh_user, ssh_private_key, **kwargs)
         self.sky_dir = sky_dir
         self.skypilot_runtime_dir = skypilot_runtime_dir
         self.remote_rsync_path = remote_rsync_path
+        self.dispatch_dir = dispatch_dir
 
     def rsync(
         self,
@@ -1921,6 +1923,37 @@ class LsfCommandRunner(SSHCommandRunner):
                                            stderr=stdout + stderr,
                                            stream_logs=stream_logs)
 
+    def _wrap_with_dispatch(self, cmd: str) -> str:
+        """Wrap a command to execute on the compute node via shared-FS dispatch.
+
+        The dispatch directory is monitored by a dispatcher daemon running
+        inside the enroot container on the compute node. This method writes
+        the command to a file in that directory, then polls for the result.
+        """
+        escaped_cmd = cmd.replace("'", "'\\''")
+        return (
+            f'SEQ=$(cat /dev/urandom | tr -dc "a-z0-9" | head -c8) && '
+            f'DDIR="{self.dispatch_dir}" && '
+            f'CMD_FILE="$DDIR/cmd_$SEQ.sh" && '
+            f"printf '%s\\n' '{escaped_cmd}' > \"$CMD_FILE\" && "
+            f'TIMEOUT=1800 && WAITED=0 && '
+            f'while [ ! -f "$DDIR/rc_$SEQ" ]; do '
+            f'sleep 0.3; WAITED=$((WAITED + 1)); '
+            f'if [ $WAITED -gt $((TIMEOUT * 3)) ]; then '
+            f'echo "ERROR: dispatch timeout after ${TIMEOUT}s"; exit 124; '
+            f'fi; done && '
+            f'cat "$DDIR/out_$SEQ.log" && '
+            f'exit $(cat "$DDIR/rc_$SEQ")')
+
+    def _login_preamble(self) -> str:
+        """Preamble for commands running directly on the login node."""
+        return (
+            f'export {constants.SKY_RUNTIME_DIR_ENV_VAR_KEY}='
+            f'"{self.skypilot_runtime_dir}" && '
+            f'{self._ENV_SETUP} && '
+            f'mkdir -p {self.sky_dir} && cd {self.sky_dir} && '
+            f'export HOME="$PWD"')
+
     @timeline.event
     @context_utils.cancellation_guard
     def run(
@@ -1933,12 +1966,30 @@ class LsfCommandRunner(SSHCommandRunner):
         # Never source bashrc on LSF login nodes — it prints banners
         # and banned-tool warnings that corrupt command output.
         kwargs['source_bashrc'] = False
-        preamble = (
-            f'export {constants.SKY_RUNTIME_DIR_ENV_VAR_KEY}='
-            f'"{self.skypilot_runtime_dir}" && '
-            f'{self._ENV_SETUP} && '
-            f'mkdir -p {self.sky_dir} && cd {self.sky_dir} && '
-            f'export HOME="$PWD"')
+        cmd_stripped = cmd.strip().lstrip(';').strip()
+
+        if self.dispatch_dir and cmd_stripped:
+            inner_cmd = self._wrap_with_dispatch(cmd_stripped)
+        else:
+            preamble = self._login_preamble()
+            if cmd_stripped:
+                inner_cmd = f'{preamble} && {cmd_stripped}'
+            else:
+                inner_cmd = preamble
+        return SSHCommandRunner.run(self, inner_cmd, **kwargs)
+
+    @timeline.event
+    @context_utils.cancellation_guard
+    def run_on_login(
+        self,
+        cmd: Union[str, List[str]],
+        **kwargs,
+    ) -> Union[int, Tuple[int, str, str]]:
+        """Run directly on the login node, bypassing dispatch."""
+        if isinstance(cmd, list):
+            cmd = ' '.join(cmd)
+        kwargs['source_bashrc'] = False
+        preamble = self._login_preamble()
         cmd_stripped = cmd.strip().lstrip(';').strip()
         if cmd_stripped:
             inner_cmd = f'{preamble} && {cmd_stripped}'
