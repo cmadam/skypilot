@@ -450,12 +450,13 @@ def _build_bsub_script(
                 provider_config.get('enroot_use_local_nvme', 'False') == 'True'
             ),
         }
+        extra_mounts = provider_config.get('enroot_mounts', [])
         container_block = _build_enroot_block(
             image_id=image_id,
             container_name=cluster_name_on_cloud,
             enroot_config=enroot_config,
             env_vars={},
-            mounts=[],
+            mounts=extra_mounts,
             dispatch_dir=dispatch_dir,
             is_multinode=(num_nodes > 1),
             inject_topology=True,
