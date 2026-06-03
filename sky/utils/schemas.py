@@ -2069,6 +2069,12 @@ def get_config_schema():
                                     },
                                 },
                             },
+                            'enroot_mounts': {
+                                'type': 'array',
+                                'items': {
+                                    'type': 'string',
+                                },
+                            },
                             'queue_configs': {
                                 'type': 'object',
                                 'required': [],

@@ -120,12 +120,16 @@ def _build_enroot_block(image_id: str, container_name: str,
                                        '-comp lz4 -Xhc -no-xattrs')
     use_nvme = enroot_config.get('use_local_nvme', False)
 
-    # Strip the docker:// scheme so downstream callers (sqsh filename,
+    # Strip the docker scheme so downstream callers (sqsh filename,
     # enroot URI conversion, and the `docker://` prefix added in the bsub
     # script) don't end up with `docker://docker://...` or filenames
     # starting with `docker---`.
+    # SkyPilot passes image_id as 'docker:registry/...' (single colon)
+    # while user YAML uses 'docker://registry/...' (double slash).
     if image_id.startswith('docker://'):
         image_id = image_id[len('docker://'):]
+    elif image_id.startswith('docker:'):
+        image_id = image_id[len('docker:'):]
 
     enroot_uri = _convert_to_enroot_uri(image_id)
     # Container name is job-specific (prevents concurrent job interference)
@@ -386,6 +390,12 @@ def _build_bsub_script(
     acc_count = provider_config.get('accelerator_count', '0')
     acc_type = provider_config.get('accelerator_type', '')
     image_id = provider_config.get('image_id', '')
+    # Normalize: strip docker scheme prefix (SkyPilot passes 'docker:...',
+    # user YAML may pass 'docker://...'). Enroot import adds its own prefix.
+    if image_id.startswith('docker://'):
+        image_id = image_id[len('docker://'):]
+    elif image_id.startswith('docker:'):
+        image_id = image_id[len('docker:'):]
     enroot_enabled = provider_config.get('enroot_enabled', 'False') == 'True'
 
     # Directories
@@ -425,8 +435,12 @@ def _build_bsub_script(
     if mem_gb > 0:
         bsub_directives.append(f'#BSUB -M {mem_gb}G')
 
-    # Custom bsub options from config
-    bsub_options = provider_config.get('bsub_options', {})
+    # Custom bsub options from config (per-queue overrides take precedence)
+    bsub_options = dict(provider_config.get('bsub_options', {}))
+    if queue:
+        queue_configs = provider_config.get('queue_configs', {})
+        if queue in queue_configs:
+            bsub_options.update(queue_configs[queue].get('bsub_options', {}))
     for key, val in bsub_options.items():
         bsub_directives.append(f'#BSUB -{key} {val}')
 
