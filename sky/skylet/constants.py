@@ -539,6 +539,7 @@ RCLONE_CACHE_REFRESH_INTERVAL = 10
 # overrides are specified in task YAMLs.
 OVERRIDEABLE_CONFIG_KEYS_IN_TASK: List[Tuple[str, ...]] = [
     ('docker', 'run_options'),
+    ('docker', 'host_image_id'),
     ('nvidia_gpus', 'disable_ecc'),
     ('ssh', 'custom_metadata'),
     ('ssh', 'pod_config'),
