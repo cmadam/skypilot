@@ -329,6 +329,7 @@ def _get_cluster_config_template(cloud):
         clouds.IBM: 'ibm-ray.yml.j2',
         clouds.SCP: 'scp-ray.yml.j2',
         clouds.Slurm: 'slurm-ray.yml.j2',
+        clouds.LSF: 'lsf-ray.yml.j2',
         clouds.OCI: 'oci-ray.yml.j2',
         clouds.Paperspace: 'paperspace-ray.yml.j2',
         clouds.PrimeIntellect: 'primeintellect-ray.yml.j2',
@@ -6617,6 +6618,24 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 slurm_job_id,
                 container_name,
             )
+        elif isinstance(handle.launched_resources.cloud, clouds.LSF):
+            dispatch_dir = None
+            container_image = (
+                list(handle.launched_resources.image_id.values())[0]
+                if handle.launched_resources.image_id else None)
+            if container_image is not None:
+                assert (handle.cached_cluster_info
+                        is not None), ('cached_cluster_info must be set')
+                provider_config = (
+                    handle.cached_cluster_info.provider_config)
+                workdir = provider_config.get('workdir', '')
+                if not workdir:
+                    workdir = '~/sky_workdir'
+                dispatch_dir = (f'{workdir}/'
+                                f'{handle.cluster_name_on_cloud}/'
+                                f'.sky/dispatch')
+            return task_codegen.LsfCodeGen(
+                container_dispatch_dir=dispatch_dir)
         else:
             return task_codegen.RayCodeGen()
 

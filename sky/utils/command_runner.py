@@ -1923,6 +1923,223 @@ class LocalProcessCommandRunner(CommandRunner):
                     timeout=timeout)
 
 
+class LsfCommandRunner(SSHCommandRunner):
+    """Runner for LSF commands.
+
+    Routes commands and file transfers through the LSF login node.
+    Handles the case where rsync is banned on login nodes by specifying
+    the full path to the real rsync binary via --rsync-path.
+    """
+
+    _ENV_SETUP = 'export UV_CACHE_DIR=/tmp/uv_cache_$(id -u)'
+
+    def __init__(
+        self,
+        node: Tuple[str, int],
+        ssh_user: str,
+        ssh_private_key: Optional[str],
+        *,
+        sky_dir: str,
+        skypilot_runtime_dir: str,
+        remote_rsync_path: str = '/usr/bin/rsync',
+        dispatch_dir: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(node, ssh_user, ssh_private_key, **kwargs)
+        self.sky_dir = sky_dir
+        self.skypilot_runtime_dir = skypilot_runtime_dir
+        self.remote_rsync_path = remote_rsync_path
+        self.dispatch_dir = dispatch_dir
+
+    def rsync(
+        self,
+        source: str,
+        target: str,
+        *,
+        up: bool,
+        log_path: str = os.devnull,
+        stream_logs: bool = True,
+        max_retry: int = 1,
+    ) -> None:
+        """Rsync with --rsync-path to bypass banned rsync wrapper on remote."""
+        if self._docker_ssh_proxy_command is not None:
+            docker_ssh_proxy_command = self._docker_ssh_proxy_command(['ssh'])
+        else:
+            docker_ssh_proxy_command = None
+        ssh_options = ' '.join(
+            ssh_options_list(
+                self.ssh_private_key,
+                self.ssh_control_name,
+                ssh_proxy_command=self._ssh_proxy_command,
+                ssh_proxy_jump=self._ssh_proxy_jump,
+                docker_ssh_proxy_command=docker_ssh_proxy_command,
+                port=self.port,
+                disable_control_master=self.disable_control_master,
+                disable_identities_only=self.disable_identities_only))
+        rsh_option = f'ssh {ssh_options}'
+        self._rsync_with_path(
+            source,
+            target,
+            node_destination=f'{self.ssh_user}@{self.ip}',
+            up=up,
+            rsh_option=rsh_option,
+            log_path=log_path,
+            stream_logs=stream_logs,
+            max_retry=max_retry)
+
+    def _rsync_with_path(
+        self,
+        source: str,
+        target: str,
+        node_destination: str,
+        up: bool,
+        rsh_option: str,
+        log_path: str = os.devnull,
+        stream_logs: bool = True,
+        max_retry: int = 1,
+    ) -> None:
+        """Like _rsync but injects --rsync-path for the remote binary."""
+        rsync_command = ['rsync', RSYNC_DISPLAY_OPTION]
+        rsync_command.append(RSYNC_NO_OWNER_NO_GROUP_OPTION)
+        if self.remote_rsync_path:
+            rsync_command.append(f'--rsync-path={self.remote_rsync_path}')
+
+        resolved_source = pathlib.Path(source).expanduser().resolve()
+        if (resolved_source / constants.SKY_IGNORE_FILE).exists():
+            rsync_command.append(RSYNC_FILTER_SKYIGNORE)
+        else:
+            rsync_command.append(RSYNC_FILTER_GITIGNORE)
+            if up and (resolved_source / GIT_EXCLUDE).exists():
+                rsync_command.append(
+                    RSYNC_EXCLUDE_OPTION.format(
+                        shlex.quote(str(resolved_source / GIT_EXCLUDE))))
+
+        rsync_command.append(f'-e {shlex.quote(rsh_option)}')
+        maybe_dest_prefix = f'{node_destination}:'
+
+        if up:
+            resolved_target = target
+            if target.startswith('~'):
+                resolved_target = target.replace('~', self.sky_dir)
+            full_source_str = str(resolved_source)
+            if resolved_source.is_dir():
+                full_source_str = os.path.join(full_source_str, '')
+            rsync_command.extend([
+                f'{full_source_str!r}',
+                f'{maybe_dest_prefix}{resolved_target!r}',
+            ])
+        else:
+            resolved_source_path = source
+            if source.startswith('~'):
+                resolved_source_path = source.replace('~', self.sky_dir)
+            resolved_target = str(
+                pathlib.Path(target).expanduser().resolve())
+            rsync_command.extend([
+                f'{maybe_dest_prefix}{resolved_source_path!r}',
+                f'{resolved_target!r}',
+            ])
+
+        command = ' '.join(rsync_command)
+        logger.debug(f'Running rsync command: {command}')
+
+        backoff = common_utils.Backoff(initial_backoff=5, max_backoff_factor=5)
+        assert max_retry > 0, f'max_retry {max_retry} must be positive.'
+        while max_retry >= 0:
+            returncode, stdout, stderr = log_lib.run_with_log(
+                command,
+                log_path=log_path,
+                stream_logs=stream_logs,
+                shell=True,
+                require_outputs=True)
+            if returncode == 0:
+                break
+            max_retry -= 1
+            time.sleep(backoff.current_backoff())
+
+        direction = 'up' if up else 'down'
+        error_msg = (f'Failed to rsync {direction}: {source} -> {target}. '
+                     'Ensure that the network is stable, then retry.')
+        subprocess_utils.handle_returncode(returncode,
+                                           command,
+                                           error_msg,
+                                           stderr=stdout + stderr,
+                                           stream_logs=stream_logs)
+
+    def _wrap_with_dispatch(self, cmd: str) -> str:
+        """Wrap a command to execute on the compute node via shared-FS dispatch.
+
+        The dispatch directory is monitored by a dispatcher daemon running
+        inside the enroot container on the compute node. This method writes
+        the command to a file in that directory, then polls for the result.
+        """
+        escaped_cmd = cmd.replace("'", "'\\''")
+        return (
+            f'SEQ=$(cat /dev/urandom | tr -dc "a-z0-9" | head -c8) && '
+            f'DDIR="{self.dispatch_dir}" && '
+            f'CMD_FILE="$DDIR/cmd_$SEQ.sh" && '
+            f"printf '%s\\n' '{escaped_cmd}' > \"$CMD_FILE\" && "
+            f'TIMEOUT=1800 && WAITED=0 && '
+            f'while [ ! -f "$DDIR/rc_$SEQ" ]; do '
+            f'sleep 0.3; WAITED=$((WAITED + 1)); '
+            f'if [ $WAITED -gt $((TIMEOUT * 3)) ]; then '
+            f'echo "ERROR: dispatch timeout after ${TIMEOUT}s"; exit 124; '
+            f'fi; done && '
+            f'cat "$DDIR/out_$SEQ.log" && '
+            f'exit $(cat "$DDIR/rc_$SEQ")')
+
+    def _login_preamble(self) -> str:
+        """Preamble for commands running directly on the login node."""
+        return (
+            f'export {constants.SKY_RUNTIME_DIR_ENV_VAR_KEY}='
+            f'"{self.skypilot_runtime_dir}" && '
+            f'{self._ENV_SETUP} && '
+            f'mkdir -p {self.sky_dir} && cd {self.sky_dir} && '
+            f'export HOME="$PWD"')
+
+    @timeline.event
+    @context_utils.cancellation_guard
+    def run(
+        self,
+        cmd: Union[str, List[str]],
+        **kwargs,
+    ) -> Union[int, Tuple[int, str, str]]:
+        if isinstance(cmd, list):
+            cmd = ' '.join(cmd)
+        # Never source bashrc on LSF login nodes — it prints banners
+        # and banned-tool warnings that corrupt command output.
+        kwargs['source_bashrc'] = False
+        cmd_stripped = cmd.strip().lstrip(';').strip()
+
+        if self.dispatch_dir and cmd_stripped:
+            inner_cmd = self._wrap_with_dispatch(cmd_stripped)
+        else:
+            preamble = self._login_preamble()
+            if cmd_stripped:
+                inner_cmd = f'{preamble} && {cmd_stripped}'
+            else:
+                inner_cmd = preamble
+        return SSHCommandRunner.run(self, inner_cmd, **kwargs)
+
+    @timeline.event
+    @context_utils.cancellation_guard
+    def run_on_login(
+        self,
+        cmd: Union[str, List[str]],
+        **kwargs,
+    ) -> Union[int, Tuple[int, str, str]]:
+        """Run directly on the login node, bypassing dispatch."""
+        if isinstance(cmd, list):
+            cmd = ' '.join(cmd)
+        kwargs['source_bashrc'] = False
+        preamble = self._login_preamble()
+        cmd_stripped = cmd.strip().lstrip(';').strip()
+        if cmd_stripped:
+            inner_cmd = f'{preamble} && {cmd_stripped}'
+        else:
+            inner_cmd = preamble
+        return SSHCommandRunner.run(self, inner_cmd, **kwargs)
+
+
 class SlurmCommandRunner(SSHCommandRunner):
     """Runner for Slurm commands.
 

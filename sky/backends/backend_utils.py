@@ -1409,6 +1409,10 @@ def _add_auth_to_cluster_config(cloud: clouds.Cloud, tmp_yaml_path: str):
         config = auth.setup_mithril_authentication(config)
     elif isinstance(cloud, clouds.Verda):
         config = auth.setup_verda_authentication(config)
+    elif isinstance(cloud, clouds.LSF):
+        # LSF uses its own SSH key from provider config — no sky-key needed
+        config['auth']['ssh_private_key'] = config['provider']['ssh'].get(
+            'private_key', config['auth'].get('ssh_private_key', ''))
     else:
         assert False, cloud
     yaml_utils.dump_yaml(tmp_yaml_path, config)

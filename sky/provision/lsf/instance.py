@@ -1,0 +1,988 @@
+"""LSF instance provisioner for SkyPilot.
+
+Manages the lifecycle of LSF jobs as virtual instances:
+submit (run_instances) → poll (wait_instances/query_instances) →
+terminate (terminate_instances).
+"""
+import base64
+import hashlib
+import logging
+import os
+import shlex
+import textwrap
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+from sky import sky_logging
+from sky.utils import status_lib
+from sky.adaptors import lsf as lsf_adaptor
+from sky.provision import common
+from sky.provision import constants as provision_constants
+from sky.provision.lsf import utils as lsf_utils
+from sky.skylet import constants
+from sky.utils import command_runner
+from sky.utils import subprocess_utils
+from sky.utils import timeline
+
+logger = sky_logging.init_logger(__name__)
+
+# How long to wait for a job to get allocated (seconds)
+_DEFAULT_PROVISION_TIMEOUT = 1800
+_POLL_INTERVAL = 5
+
+
+def _get_client(provider_config: Dict[str, Any]) -> lsf_adaptor.LsfClient:
+    """Create an LsfClient from provider config."""
+    ssh_config = provider_config.get('ssh', {})
+    is_local = provider_config.get('is_inside_lsf_cluster', False)
+
+    if is_local:
+        return lsf_adaptor.LsfClient(is_inside_lsf_cluster=True)
+
+    return lsf_adaptor.LsfClient(
+        ssh_host=ssh_config.get('hostname'),
+        ssh_port=int(ssh_config.get('port', 22)),
+        ssh_user=ssh_config.get('user'),
+        ssh_key=ssh_config.get('private_key'),
+        ssh_proxy_command=ssh_config.get('proxy_command'),
+        ssh_proxy_jump=ssh_config.get('proxy_jump'),
+        identities_only=ssh_config.get('identities_only', False),
+    )
+
+
+def _image_hash(image_id: str) -> str:
+    """Generate a short hash for a Docker image URI (for cache filenames)."""
+    return hashlib.sha256(image_id.encode()).hexdigest()[:16]
+
+
+def _build_blaunch_dispatch(share_path: str, is_multinode: bool) -> str:
+    """Build the blaunch dispatch block for multi-node jobs.
+
+    When multi-node, the master node imports/flattens the sqsh, then uses
+    blaunch to re-run the script on all allocated nodes. Workers (BV_WORKER=1)
+    skip import and go directly to container create/start.
+    """
+    if not is_multinode:
+        return ''
+    return textwrap.dedent(f"""\
+        # ── Multi-node blaunch dispatch (master only) ─────────────────────
+        if [[ "${{BV_WORKER}}" != "1" && ${{TOTAL_NODES:-1}} -gt 1 ]]; then
+            echo "[$(date)] Launching workers on $TOTAL_NODES nodes via blaunch"
+            SHARED_SCRIPT="{share_path}/tmp/sky-worker-$LSB_JOBID.sh"
+            mkdir -p "$(dirname "$SHARED_SCRIPT")"
+            cp "$(realpath "${{BASH_SOURCE[0]}}")" "$SHARED_SCRIPT"
+            export BV_WORKER=1
+            blaunch bash "$SHARED_SCRIPT"
+            exit $?
+        fi
+    """)
+
+
+def _convert_to_enroot_uri(image_id: str) -> str:
+    """Convert Docker image URI to enroot format (registry/path → registry#path)."""
+    registry = image_id.split('/')[0]
+    if '/' in image_id and '.' in registry:
+        remainder = image_id[len(registry) + 1:]
+        return f'{registry}#{remainder}'
+    return image_id
+
+
+def _sqsh_name_from_image(image_id: str) -> str:
+    """Derive sqsh filename from image name (shared across all jobs using same image).
+
+    e.g. us.icr.io/cil15-shared-registry/sage-py311:0.025
+      -> us.icr.io-cil15-shared-registry-sage-py311-0.025.sqsh
+    """
+    return image_id.replace('/', '-').replace(':', '-') + '.sqsh'
+
+
+def _build_enroot_block(image_id: str, container_name: str,
+                        enroot_config: Dict[str, Any],
+                        env_vars: Dict[str, str],
+                        mounts: List[str],
+                        dispatch_dir: str,
+                        is_multinode: bool = False,
+                        inject_topology: bool = True) -> str:
+    """Build the full enroot setup block with BlueVela workarounds.
+
+    Container isolation strategy (per gbansible guidelines):
+    - Sqsh file: derived from IMAGE NAME, shared on shared FS (all jobs
+      using the same image reuse the same sqsh)
+    - Container name: derived from JOB NAME (cluster_name_on_cloud),
+      unique per job — prevents concurrent jobs from destroying each
+      other's containers via enroot create -f or enroot remove -f
+    - inject_topology: when True, passes NUM_GPUS_PER_NODE, WORLD_SIZE,
+      RANK, MASTER_ADDR, MASTER_PORT, and LSF job vars into the container
+      so training scripts can derive distributed config
+    """
+    share_path = enroot_config.get('share_path', '/tmp')
+    squash_options = enroot_config.get('squash_options',
+                                       '-comp lz4 -Xhc -no-xattrs')
+    use_nvme = enroot_config.get('use_local_nvme', False)
+
+    # Strip the docker scheme so downstream callers (sqsh filename,
+    # enroot URI conversion, and the `docker://` prefix added in the bsub
+    # script) don't end up with `docker://docker://...` or filenames
+    # starting with `docker---`.
+    # SkyPilot passes image_id as 'docker:registry/...' (single colon)
+    # while user YAML uses 'docker://registry/...' (double slash).
+    if image_id.startswith('docker://'):
+        image_id = image_id[len('docker://'):]
+    elif image_id.startswith('docker:'):
+        image_id = image_id[len('docker:'):]
+
+    enroot_uri = _convert_to_enroot_uri(image_id)
+    # Container name is job-specific (prevents concurrent job interference)
+    container_name_safe = container_name.replace('/', '-').replace(':', '-')
+    # Sqsh file is image-specific (shared across all jobs using same image)
+    sqsh_filename = _sqsh_name_from_image(image_id)
+    sqsh_file = f'{share_path}/enroot/{sqsh_filename}'
+
+    enroot_data_path = ('/opt/nvme/$USER/enroot-data'
+                        if use_nvme else f'{share_path}/user-$(id -u)/enroot-data')
+
+    # Static env lines (written via quoted heredoc — no shell expansion)
+    static_env_lines = '    echo "NVIDIA_VISIBLE_DEVICES=all"\n'
+    static_env_lines += '    echo "NVIDIA_DRIVER_CAPABILITIES=compute,utility"\n'
+    static_env_lines += ('    echo "LD_LIBRARY_PATH='
+                         '/opt/share/mpich-4.2.2/lib'
+                         '${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\n')
+    for key, val in env_vars.items():
+        static_env_lines += f'    echo "{key}={val}"\n'
+
+    # Dynamic env lines (written via unquoted heredoc — vars expand at
+    # config-write time from the topology_block shell vars).
+    dynamic_env_lines = ''
+    if inject_topology:
+        dynamic_env_lines = (
+            '    echo "NUM_GPUS_PER_NODE=${NUM_GPUS_PER_NODE}"\n'
+            '    echo "TOTAL_NODES=${TOTAL_NODES}"\n'
+            '    echo "RANK=${RANK}"\n'
+            '    echo "WORLD_SIZE=${WORLD_SIZE}"\n'
+            '    echo "LOCAL_RANK=${LOCAL_RANK}"\n'
+            '    echo "MASTER_ADDR=${MASTER_HOST}"\n'
+            '    echo "MASTER_PORT=${MASTER_PORT:-29500}"\n'
+            '    echo "LSB_JOBID=${LSB_JOBID:-}"\n'
+            '    echo "LSB_HOSTS=${LSB_HOSTS:-$(hostname)}"\n'
+        )
+
+    # Build mount lines for enroot config
+    mount_lines = '    echo "/proj /proj"\n'
+    mount_lines += '    echo "/tmp /tmp"\n'
+    mount_lines += '    echo "/opt/nvme /opt/nvme"\n'
+    mount_lines += '    echo "/opt/share /opt/share"\n'
+    for m in mounts:
+        mount_lines += f'    echo "{m}"\n'
+
+    block = f"""\
+# === Enroot container setup ===
+
+# ── BlueVela workarounds ──────────────────────────────────────────────
+BV_WRAPPER_DIR=$(mktemp -d -t bv-enroot-wrappers.XXXXXX)
+export PATH="${{BV_WRAPPER_DIR}}:${{PATH}}"
+
+if ! command -v fusermount &>/dev/null && command -v fusermount3 &>/dev/null; then
+    ln -sf "$(command -v fusermount3)" "${{BV_WRAPPER_DIR}}/fusermount"
+fi
+
+printf '#!/bin/bash\\n/usr/bin/enroot-aufs2ovlfs "$@" || true\\n' \\
+    > "${{BV_WRAPPER_DIR}}/enroot-aufs2ovlfs"
+chmod +x "${{BV_WRAPPER_DIR}}/enroot-aufs2ovlfs"
+
+cat > "${{BV_WRAPPER_DIR}}/enroot-mksquashovlfs" << 'WRAPPER'
+#!/bin/bash
+LAYERS="$1"; OUTFILE="$2"; shift 2
+/usr/bin/enroot-mksquashovlfs "$LAYERS" "$OUTFILE" "$@" 2>/dev/null
+if [ $? -eq 0 ] && [ -f "$OUTFILE" ]; then exit 0; fi
+IFS=':' read -ra LAYER_DIRS <<< "$LAYERS"
+mksquashfs "${{LAYER_DIRS[@]}}" "$OUTFILE" "$@" -no-xattrs
+WRAPPER
+chmod +x "${{BV_WRAPPER_DIR}}/enroot-mksquashovlfs"
+
+# ── Enroot path setup ─────────────────────────────────────────────────
+export ENROOT_DATA_PATH="{enroot_data_path}"
+export ENROOT_CACHE_PATH="{share_path}/user-$(id -u)/enroot-cache"
+export ENROOT_SQUASH_OPTIONS='{squash_options}'
+export ENROOT_MOUNT_HOME=false
+export ENROOT_RUNTIME_PATH="/tmp/user-$(id -u)/enroot-runtime"
+export ENROOT_TEMP_PATH="/tmp/user-$(id -u)/enroot-tmp"
+export XDG_RUNTIME_DIR="/tmp/user-$(id -u)/xdg-runtime"
+
+mkdir -p "$ENROOT_DATA_PATH" "$ENROOT_CACHE_PATH" \\
+         "$ENROOT_RUNTIME_PATH" "$ENROOT_TEMP_PATH" "$XDG_RUNTIME_DIR"
+
+SQSH_FILE="{sqsh_file}"
+CONTAINER_NAME="{container_name_safe}"
+mkdir -p "$(dirname "$SQSH_FILE")"
+
+# ── Helper: flatten layered sqsh ──────────────────────────────────────
+flatten_sqsh_if_needed() {{
+    local sqsh_file="$1"
+    local mount_dir="/tmp/user-$(id -u)/sqsh-check"
+    mkdir -p "$mount_dir"
+    squashfuse "$sqsh_file" "$mount_dir" 2>/dev/null || return 0
+    local is_layered=0
+    if [[ -d "$mount_dir/0" ]] && [[ ! -d "$mount_dir/bin" ]]; then
+        is_layered=1
+    fi
+    fusermount3 -u "$mount_dir" 2>/dev/null || fusermount -u "$mount_dir" 2>/dev/null || true
+
+    if [[ $is_layered -eq 0 ]]; then
+        echo "[$(date)] Sqsh is already flat"
+        return 0
+    fi
+
+    echo "[$(date)] Sqsh has layered OCI structure, flattening..."
+    local work_dir="/opt/nvme/$USER/flatten-work"
+    local local_flat="/opt/nvme/$USER/$(basename "$sqsh_file" .sqsh)-flat.sqsh"
+    rm -rf "$work_dir" "$local_flat"
+    mkdir -p "$work_dir"/{{layers,merged,upper,work}}
+
+    squashfuse "$sqsh_file" "$work_dir/layers"
+    local lowerdir
+    lowerdir=$(ls -d "$work_dir/layers"/*/ | sort -t/ -k7 -n -r | tr '\\n' ':' | sed 's/:$//')
+    fuse-overlayfs -o "lowerdir=${{lowerdir}},upperdir=$work_dir/upper,workdir=$work_dir/work" "$work_dir/merged"
+
+    echo "[$(date)] Creating flat sqsh on local NVME..."
+    mksquashfs "$work_dir/merged" "$local_flat" -comp lz4 -Xhc -noappend >/dev/null 2>&1
+
+    echo "[$(date)] Copying flat sqsh to shared filesystem..."
+    cp "$local_flat" "$sqsh_file"
+    chmod g+rw "$sqsh_file" 2>/dev/null || true
+    echo "[$(date)] Flatten complete: $(du -h "$sqsh_file" | cut -f1)"
+
+    fusermount3 -u "$work_dir/merged" 2>/dev/null || true
+    fusermount3 -u "$work_dir/layers" 2>/dev/null || true
+    rm -rf "$work_dir" "$local_flat"
+}}
+
+# ── Step 1: Import + Flatten (master only for multi-node) ─────────────
+# Uses flock to prevent concurrent imports of the same image by
+# multiple jobs. Only one job proceeds with import; others wait.
+if [[ "${{BV_WORKER}}" != "1" ]]; then
+    LOCK_FILE="${{SQSH_FILE}}.lock"
+    (
+        flock -x 200
+        if [[ -f "$SQSH_FILE" ]]; then
+            echo "[$(date)] Squash file exists: $SQSH_FILE ($(du -h "$SQSH_FILE" | cut -f1)), skipping import"
+        else
+            echo "[$(date)] Importing docker://{enroot_uri} → $SQSH_FILE"
+            if ! enroot import -o "$SQSH_FILE" "docker://{enroot_uri}"; then
+                if [[ -f "$SQSH_FILE" ]] && [[ -s "$SQSH_FILE" ]]; then
+                    echo "[$(date)] Import completed with warnings (sqsh file was created)"
+                else
+                    echo "ERROR: enroot import failed for {image_id}"
+                    exit 1
+                fi
+            fi
+            chmod g+rw "$SQSH_FILE" 2>/dev/null || true
+            echo "[$(date)] Import complete: $(du -h "$SQSH_FILE" | cut -f1)"
+            flatten_sqsh_if_needed "$SQSH_FILE"
+        fi
+    ) 200>"$LOCK_FILE"
+fi
+{_build_blaunch_dispatch(share_path, is_multinode)}
+# ── NVME pre-flight check ─────────────────────────────────────────────
+NVME_USAGE=$(df /opt/nvme 2>/dev/null | awk 'NR==2 {{print $5}}' | sed 's/%//')
+if [[ -n "$NVME_USAGE" && $NVME_USAGE -gt 85 ]]; then
+    echo "[$(date)] WARNING: /opt/nvme is ${{NVME_USAGE}}% full"
+fi
+
+# ── Step 2: Create container (per-node) ───────────────────────────────
+echo "[$(date)] Creating container '$CONTAINER_NAME' from $SQSH_FILE"
+enroot create -f -n "$CONTAINER_NAME" "$SQSH_FILE" || {{
+    echo "ERROR: enroot create failed"
+    exit 1
+}}
+chmod -R a+rw "$ENROOT_DATA_PATH/$CONTAINER_NAME" 2>/dev/null || true
+
+# Kill catatonit orphans spawned by THIS container's create only.
+# Scoped to children of this shell to avoid killing other jobs'
+# catatonit processes (which would destroy their containers).
+pkill -9 -P $$ -x catatonit 2>/dev/null || true
+
+# Replace entrypoint with passthrough
+CONTAINER_RC="$ENROOT_DATA_PATH/$CONTAINER_NAME/etc/rc"
+if [[ -f "$CONTAINER_RC" ]]; then
+    printf '#!/bin/sh\\nexec "$@"\\n' > "$CONTAINER_RC"
+fi
+
+# Validate container filesystem
+CONTAINER_SHELL="$ENROOT_DATA_PATH/$CONTAINER_NAME/bin/sh"
+if [[ ! -f "$CONTAINER_SHELL" ]]; then
+    echo "[$(date)] ERROR: Container filesystem incomplete (missing /bin/sh)"
+    enroot remove -f "$CONTAINER_NAME" 2>/dev/null || true
+    rm -rf "$ENROOT_DATA_PATH/$CONTAINER_NAME" 2>/dev/null || true
+    exit 1
+fi
+
+# ── Step 3: Generate enroot config and start ──────────────────────────
+ENROOT_CONFIG_FILE=$(mktemp -t enroot.config.XXXXXX)
+# Static part (quoted heredoc — no shell expansion)
+cat > "$ENROOT_CONFIG_FILE" << 'ENROOT_CFG_STATIC'
+environ() {{
+    env | grep -v '^PATH=\\|^HOME=\\|^LANG=\\|^HOSTNAME='
+    echo "HOME=/"
+    echo "PATH=/opt/miniconda3/bin:/opt/miniconda3/condabin:/opt/conda/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+{static_env_lines}ENROOT_CFG_STATIC
+# Dynamic part (unquoted heredoc — RANK/WORLD_SIZE expand now)
+cat >> "$ENROOT_CONFIG_FILE" << ENROOT_CFG_DYNAMIC
+{dynamic_env_lines}}}
+mounts() {{
+{mount_lines}}}
+ENROOT_CFG_DYNAMIC
+
+# ── Step 4: Command dispatcher ─────────────────────────────────────────
+DISPATCH_DIR="{dispatch_dir}"
+rm -rf "$DISPATCH_DIR"
+mkdir -p "$DISPATCH_DIR"
+cat > "$DISPATCH_DIR/dispatcher.sh" << 'DISPATCH_EOF'
+#!/bin/bash
+DDIR="$1"
+touch "$DDIR/.ready"
+while true; do
+    for cmd_file in "$DDIR"/cmd_*.sh; do
+        [ -f "$cmd_file" ] || continue
+        seq="${{cmd_file##*/cmd_}}"; seq="${{seq%.sh}}"
+        /bin/bash "$cmd_file" > "$DDIR/out_${{seq}}.log" 2>&1
+        echo $? > "$DDIR/rc_${{seq}}"
+        mv "$cmd_file" "$DDIR/done_${{seq}}.sh"
+    done
+    [ -f "$DDIR/.shutdown" ] && break
+    sleep 0.5
+done
+DISPATCH_EOF
+chmod +x "$DISPATCH_DIR/dispatcher.sh"
+
+echo "[$(date)] Starting container with command dispatcher"
+enroot start --conf "$ENROOT_CONFIG_FILE" --rw "$CONTAINER_NAME" \\
+    bash "$DISPATCH_DIR/dispatcher.sh" "$DISPATCH_DIR" &
+ENROOT_PID=$!
+
+# Wait for container to signal readiness
+echo "[$(date)] Waiting for container dispatcher to be ready..."
+READY_WAIT=0
+while [ ! -f "$DISPATCH_DIR/.ready" ]; do
+    sleep 0.5
+    READY_WAIT=$((READY_WAIT + 1))
+    if [ $READY_WAIT -gt 120 ]; then
+        echo "ERROR: Container dispatcher did not become ready in 60s"
+        exit 1
+    fi
+done
+echo "[$(date)] Enroot container ready (PID=$ENROOT_PID), dispatch_dir=$DISPATCH_DIR"
+"""
+    return block
+
+
+def _build_bsub_script(
+    cluster_name_on_cloud: str,
+    provider_config: Dict[str, Any],
+    num_nodes: int,
+) -> str:
+    """Build a bsub script for provisioning virtual instances."""
+    cluster = lsf_utils.get_lsf_cluster_from_config(provider_config)
+    queue = lsf_utils.get_queue_from_config(provider_config)
+
+    # Resource configuration
+    cpus = provider_config.get('cpus', '4')
+    memory = provider_config.get('memory', '16')
+    acc_count = provider_config.get('accelerator_count', '0')
+    acc_type = provider_config.get('accelerator_type', '')
+    image_id = provider_config.get('image_id', '')
+    # Normalize: strip docker scheme prefix (SkyPilot passes 'docker:...',
+    # user YAML may pass 'docker://...'). Enroot import adds its own prefix.
+    if image_id.startswith('docker://'):
+        image_id = image_id[len('docker://'):]
+    elif image_id.startswith('docker:'):
+        image_id = image_id[len('docker:'):]
+    enroot_enabled = provider_config.get('enroot_enabled', 'False') == 'True'
+
+    # Directories
+    workdir = provider_config.get('workdir', '')
+    tmpdir = provider_config.get('tmpdir', '')
+    if not workdir:
+        workdir = f'~/sky_workdir/{cluster_name_on_cloud}'
+    if not tmpdir:
+        tmpdir = f'/tmp/skypilot/{cluster_name_on_cloud}'
+
+    sky_cluster_home = f'{workdir}/{cluster_name_on_cloud}'
+
+    # Build #BSUB directives
+    bsub_directives = [
+        f'#BSUB -J {cluster_name_on_cloud}',
+        f'#BSUB -o {sky_cluster_home}/sky_logs/%J.out',
+        f'#BSUB -e {sky_cluster_home}/sky_logs/%J.err',
+    ]
+
+    if queue:
+        bsub_directives.append(f'#BSUB -q {queue}')
+
+    if num_nodes > 1:
+        bsub_directives.append(f'#BSUB -n {num_nodes}')
+        bsub_directives.append('#BSUB -R "span[ptile=1]"')
+        bsub_directives.append('#BSUB -hl')
+    else:
+        bsub_directives.append('#BSUB -n 1')
+
+    # GPU allocation
+    if int(acc_count) > 0:
+        gpu_directive = f'#BSUB -gpu "num={acc_count}:mode=exclusive_process"'
+        bsub_directives.append(gpu_directive)
+
+    # Memory
+    mem_gb = int(float(memory))
+    if mem_gb > 0:
+        bsub_directives.append(f'#BSUB -M {mem_gb}G')
+
+    # Custom bsub options from config (per-queue overrides take precedence)
+    bsub_options = dict(provider_config.get('bsub_options', {}))
+    if queue:
+        queue_configs = provider_config.get('queue_configs', {})
+        if queue in queue_configs:
+            bsub_options.update(queue_configs[queue].get('bsub_options', {}))
+    for key, val in bsub_options.items():
+        bsub_directives.append(f'#BSUB -{key} {val}')
+
+    directives_str = '\n'.join(bsub_directives)
+
+    # NCCL tuning
+    nccl_tuning = provider_config.get('nccl_tuning_file', '')
+    nccl_block = ''
+    if nccl_tuning:
+        nccl_block = f'[ -f "{nccl_tuning}" ] && source "{nccl_tuning}"'
+
+    # Container block
+    dispatch_dir = f'{sky_cluster_home}/.sky/dispatch'
+    container_block = ''
+    if image_id and enroot_enabled:
+        enroot_config = {
+            'share_path': provider_config.get('enroot_share_path', '/tmp'),
+            'squash_options': provider_config.get('enroot_squash_options',
+                                                   '-comp lz4 -Xhc -no-xattrs'),
+            'use_local_nvme': (
+                provider_config.get('enroot_use_local_nvme', 'False') == 'True'
+            ),
+        }
+        extra_mounts = provider_config.get('enroot_mounts', [])
+        container_block = _build_enroot_block(
+            image_id=image_id,
+            container_name=cluster_name_on_cloud,
+            enroot_config=enroot_config,
+            env_vars={},
+            mounts=extra_mounts,
+            dispatch_dir=dispatch_dir,
+            is_multinode=(num_nodes > 1),
+            inject_topology=True,
+        )
+
+    # Topology setup — always compute for container jobs (training scripts
+    # like run_dense_enroot.sh need NUM_GPUS_PER_NODE, WORLD_SIZE, etc.)
+    topology_block = ''
+    if image_id and enroot_enabled:
+        rank_detection = ''
+        if num_nodes > 1:
+            rank_detection = textwrap.dedent("""\
+                # Deduplicate while preserving order (first host = rank 0 = master)
+                UNIQUE_HOSTS=($(echo "$LSB_HOSTS" | tr ' ' '\\n' | awk '!seen[$0]++'))
+                if [[ -n "$LSB_HOSTS" ]]; then
+                    for i in "${!UNIQUE_HOSTS[@]}"; do
+                        if [[ "${UNIQUE_HOSTS[$i]}" == "$LOCAL_HOST" ]]; then
+                            RANK=$i
+                            break
+                        fi
+                    done
+                fi
+            """)
+        topology_block = textwrap.dedent("""\
+            # === Compute topology ===
+            NUM_GPUS_PER_NODE=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
+            TOTAL_NODES=$(echo "${{LSB_HOSTS:-$(hostname)}}" | tr ' ' '\\n' | sort -u | wc -l)
+            LOCAL_HOST=$(hostname -s)
+            MASTER_HOST=$(echo "${{LSB_HOSTS:-$(hostname -s)}}" | awk '{{print $1}}')
+            MASTER_PORT=$((29500 + (${{LSB_JOBID:-0}} % 1000)))
+
+            RANK=0
+            WORLD_SIZE=$TOTAL_NODES
+            LOCAL_RANK=0
+            {rank_detection}
+            export MASTER_ADDR="$MASTER_HOST"
+            export MASTER_PORT RANK WORLD_SIZE LOCAL_RANK
+            export NUM_GPUS_PER_NODE TOTAL_NODES
+            echo "[$(date)] Topology: node=$LOCAL_HOST rank=$RANK/$WORLD_SIZE gpus=$NUM_GPUS_PER_NODE master=$MASTER_HOST:$MASTER_PORT"
+        """).format(rank_detection=rank_detection)
+
+    # Marker file and ready signal
+    marker_file = f'{sky_cluster_home}/{lsf_utils.LSF_MARKER_FILE}'
+    ready_signal = f'{sky_cluster_home}/.sky_ready'
+
+    script = textwrap.dedent(f"""\
+        #!/bin/bash
+        {directives_str}
+
+        # === SkyPilot LSF provisioner ===
+        set -e
+
+        cleanup() {{
+            local exit_code=$?
+            set +e
+            echo "[$(date)] Cleaning up SkyPilot LSF instance..."
+            # Signal dispatcher to shut down gracefully
+            [ -d "{dispatch_dir}" ] && touch "{dispatch_dir}/.shutdown"
+            # Kill background processes (enroot dispatcher, etc.)
+            kill $(jobs -p) 2>/dev/null || true
+            # Kill catatonit orphans (scoped to this job's process tree)
+            pkill -9 -P $$ -x catatonit 2>/dev/null || true
+            # Remove enroot container if it exists
+            if command -v enroot &>/dev/null && [[ -n "${{CONTAINER_NAME:-}}" ]]; then
+                enroot remove -f "$CONTAINER_NAME" 2>/dev/null || true
+            fi
+            # Remove temp wrapper directory
+            [[ -n "${{BV_WRAPPER_DIR:-}}" && -d "${{BV_WRAPPER_DIR:-}}" ]] && rm -rf "$BV_WRAPPER_DIR"
+            echo "[$(date)] Cleanup done (exit code: $exit_code)"
+            exit $exit_code
+        }}
+        trap cleanup EXIT
+        trap 'exit 0' TERM
+
+        # Create directories
+        mkdir -p "{sky_cluster_home}/sky_logs" "{sky_cluster_home}/.sky"
+        mkdir -p "{tmpdir}"
+
+        # Remove stale ready signal from previous runs
+        rm -f "{ready_signal}"
+
+        # Write marker file
+        touch "{marker_file}"
+
+        {nccl_block}
+
+        {topology_block}
+
+        {container_block}
+
+        # Signal ready
+        touch "{ready_signal}"
+        echo "SkyPilot LSF instance ready: {cluster_name_on_cloud}"
+
+        # Keep job alive until terminated
+        if [[ -n "${{ENROOT_PID:-}}" ]]; then
+            # Container mode: wait for dispatcher to exit (or be killed)
+            wait $ENROOT_PID
+        else
+            # Bare-metal mode: sleep forever
+            sleep infinity
+        fi
+    """)
+
+    return script
+
+
+@timeline.event
+def run_instances(
+    region: str,
+    cluster_name: str,
+    cluster_name_on_cloud: str,
+    config: common.ProvisionConfig,
+) -> common.ProvisionRecord:
+    """Submit an LSF job as a virtual instance."""
+    provider_config = config.provider_config
+    num_nodes = config.count
+
+    client = _get_client(provider_config)
+    queue = lsf_utils.get_queue_from_config(provider_config)
+
+    # Check for existing job with same name
+    existing_states = client.get_jobs_state_by_name(cluster_name_on_cloud)
+    running_states = [s for s in existing_states
+                      if s in (lsf_adaptor.LSF_STATE_RUN,
+                               lsf_adaptor.LSF_STATE_PEND)]
+    if running_states:
+        # Resume existing job
+        job_ids = client.query_jobs(job_name=cluster_name_on_cloud,
+                                    state_filters=[lsf_adaptor.LSF_STATE_RUN,
+                                                   lsf_adaptor.LSF_STATE_PEND])
+        if job_ids:
+            job_id = job_ids[0]
+            logger.info(f'Resuming existing LSF job {job_id} for '
+                        f'{cluster_name_on_cloud}')
+            nodes, _ = client.get_job_nodes(job_id)
+            instance_ids = [lsf_utils.instance_id(job_id, n) for n in nodes]
+            return common.ProvisionRecord(
+                provider_name='lsf',
+                region=region,
+                zone=queue,
+                cluster_name=cluster_name,
+                head_instance_id=instance_ids[0],
+                resumed_instance_ids=instance_ids,
+                created_instance_ids=[],
+            )
+
+    # Build and upload job script
+    script_content = _build_bsub_script(
+        cluster_name_on_cloud, provider_config, num_nodes)
+
+    # Write script to a temp file and upload
+    cluster = lsf_utils.get_lsf_cluster_from_config(provider_config)
+    workdir = provider_config.get('workdir', '') or f'~/sky_workdir'
+    remote_script_dir = f'{workdir}/{cluster_name_on_cloud}/.sky'
+    remote_script_path = f'{remote_script_dir}/provision.sh'
+
+    # Create remote dir and write script
+    ssh_config = provider_config.get('ssh', {})
+    runner = client._runner
+    rc, _, stderr = runner.run(
+        f'mkdir -p {shlex.quote(remote_script_dir)}',
+        require_outputs=True, separate_stderr=True, stream_logs=False)
+    if rc != 0:
+        raise RuntimeError(f'Failed to create script directory: {stderr}')
+
+    # Write script via pipe (rsync fails on systems with login banners)
+    encoded = base64.b64encode(script_content.encode()).decode()
+    rc, _, stderr = runner.run(
+        f'echo {shlex.quote(encoded)} | base64 -d > '
+        f'{shlex.quote(remote_script_path)} && '
+        f'chmod +x {shlex.quote(remote_script_path)}',
+        require_outputs=True, separate_stderr=True, stream_logs=False)
+    if rc != 0:
+        raise RuntimeError(f'Failed to write provision script: {stderr}')
+
+    # Remove stale ready signal before submitting (prevents race with
+    # _wait_for_ready_signal finding a leftover file from a previous run)
+    sky_cluster_home = f'{workdir}/{cluster_name_on_cloud}'
+    ready_file = f'{sky_cluster_home}/.sky_ready'
+    runner.run(f'rm -f {shlex.quote(ready_file)}',
+               require_outputs=True, separate_stderr=True, stream_logs=False)
+
+    # Submit job
+    job_id = client.submit_job(
+        queue=queue,
+        job_name=cluster_name_on_cloud,
+        script_path=remote_script_path,
+    )
+    logger.info(f'Submitted LSF job {job_id} for {cluster_name_on_cloud}')
+
+    # Wait for job to get nodes allocated
+    nodes = _wait_for_job_nodes(client, job_id, cluster_name_on_cloud)
+    instance_ids = [lsf_utils.instance_id(job_id, n) for n in nodes]
+
+    # Wait for bsub script to signal readiness (includes container setup)
+    image_id = provider_config.get('image_id', '')
+    enroot_enabled = provider_config.get('enroot_enabled', 'False') == 'True'
+    if image_id and enroot_enabled:
+        _wait_for_ready_signal(runner, ready_file, cluster_name_on_cloud)
+
+    return common.ProvisionRecord(
+        provider_name='lsf',
+        region=region,
+        zone=queue,
+        cluster_name=cluster_name,
+        head_instance_id=instance_ids[0],
+        resumed_instance_ids=[],
+        created_instance_ids=instance_ids,
+    )
+
+
+def _wait_for_job_nodes(client: lsf_adaptor.LsfClient,
+                        job_id: str,
+                        cluster_name: str,
+                        timeout: int = _DEFAULT_PROVISION_TIMEOUT
+                        ) -> List[str]:
+    """Wait until an LSF job has nodes allocated."""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        state = client.get_job_state(job_id)
+        if state is None:
+            raise RuntimeError(
+                f'LSF job {job_id} for {cluster_name} not found.')
+
+        if state in lsf_adaptor.LSF_TERMINAL_STATES:
+            raise RuntimeError(
+                f'LSF job {job_id} for {cluster_name} terminated with '
+                f'state {state} before nodes were allocated.')
+
+        if state == lsf_adaptor.LSF_STATE_RUN:
+            if client.check_job_has_nodes(job_id):
+                nodes, _ = client.get_job_nodes(job_id)
+                logger.info(f'Job {job_id} running on nodes: {nodes}')
+                return nodes
+
+        time.sleep(_POLL_INTERVAL)
+
+    raise TimeoutError(
+        f'Timed out waiting for LSF job {job_id} ({cluster_name}) '
+        f'to get nodes allocated after {timeout}s.')
+
+
+def _wait_for_ready_signal(runner, ready_file: str, cluster_name: str,
+                           timeout: int = 600) -> None:
+    """Wait for the bsub script to signal readiness via a file on shared FS."""
+    logger.info(f'Waiting for container readiness: {ready_file}')
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        rc, _, _ = runner.run(
+            f'test -f {shlex.quote(ready_file)}',
+            require_outputs=True, separate_stderr=True, stream_logs=False)
+        if rc == 0:
+            logger.info(f'Container ready for {cluster_name}')
+            return
+        time.sleep(_POLL_INTERVAL)
+    raise TimeoutError(
+        f'Timed out waiting for container readiness for {cluster_name} '
+        f'after {timeout}s. File not found: {ready_file}')
+
+
+def wait_instances(
+    region: str,
+    cluster_name_on_cloud: str,
+    state: Optional['status_lib.ClusterStatus'],
+) -> None:
+    """Wait for instances — no-op since run_instances already waits."""
+    del region, cluster_name_on_cloud, state
+
+
+def get_cluster_info(
+    region: str,
+    cluster_name_on_cloud: str,
+    provider_config: Dict[str, Any],
+) -> common.ClusterInfo:
+    """Get information about the running LSF cluster."""
+    client = _get_client(provider_config)
+    ssh_config = provider_config.get('ssh', {})
+
+    # Find the running job
+    job_ids = client.query_jobs(
+        job_name=cluster_name_on_cloud,
+        state_filters=[lsf_adaptor.LSF_STATE_RUN])
+
+    if not job_ids:
+        return common.ClusterInfo(
+            instances={},
+            head_instance_id=None,
+            provider_name='lsf',
+            provider_config=provider_config,
+        )
+
+    job_id = job_ids[0]
+    nodes, node_ips = client.get_job_nodes(job_id)
+
+    instances = {}
+    for i, (node, ip) in enumerate(zip(nodes, node_ips)):
+        inst_id = lsf_utils.instance_id(job_id, node)
+        instances[inst_id] = [
+            common.InstanceInfo(
+                instance_id=inst_id,
+                internal_ip=ip,
+                external_ip=ssh_config.get('hostname'),
+                tags={
+                    provision_constants.TAG_SKYPILOT_CLUSTER_NAME:
+                        cluster_name_on_cloud,
+                    'job_id': job_id,
+                    'node': node,
+                    'rank': str(i),
+                },
+                ssh_port=int(ssh_config.get('port', 22)),
+            )
+        ]
+
+    head_instance_id = lsf_utils.instance_id(job_id, nodes[0])
+
+    return common.ClusterInfo(
+        instances=instances,
+        head_instance_id=head_instance_id,
+        provider_name='lsf',
+        provider_config=provider_config,
+        ssh_user=ssh_config.get('user'),
+    )
+
+
+def query_instances(
+    cluster_name: str,
+    cluster_name_on_cloud: str,
+    provider_config: Dict[str, Any],
+    non_terminated_only: bool = True,
+    retry_if_missing: bool = False,
+) -> Dict[str, Optional[Tuple[Optional['status_lib.ClusterStatus'],
+                               Optional[str]]]]:
+    """Query instance statuses."""
+    client = _get_client(provider_config)
+
+    # Map LSF states to SkyPilot ClusterStatus
+    state_map = {
+        lsf_adaptor.LSF_STATE_PEND: status_lib.ClusterStatus.INIT,
+        lsf_adaptor.LSF_STATE_RUN: status_lib.ClusterStatus.UP,
+        lsf_adaptor.LSF_STATE_WAIT: status_lib.ClusterStatus.INIT,
+    }
+
+    # Query jobs by name
+    all_job_ids = client.query_jobs(job_name=cluster_name_on_cloud)
+    if not all_job_ids:
+        return {}
+
+    result = {}
+    for job_id in all_job_ids:
+        state = client.get_job_state(job_id)
+        if state is None:
+            continue
+
+        cluster_status = state_map.get(state)
+
+        if non_terminated_only and cluster_status is None:
+            continue
+
+        # Try to get nodes for running jobs
+        if state == lsf_adaptor.LSF_STATE_RUN:
+            try:
+                nodes, _ = client.get_job_nodes(job_id)
+                for node in nodes:
+                    inst_id = lsf_utils.instance_id(job_id, node)
+                    result[inst_id] = (cluster_status, None)
+            except Exception:  # pylint: disable=broad-except
+                result[job_id] = (cluster_status, None)
+        else:
+            result[job_id] = (cluster_status, state)
+
+    return result
+
+
+def stop_instances(
+    cluster_name_on_cloud: str,
+    provider_config: Dict[str, Any],
+    worker_only: bool = False,
+) -> None:
+    """Stop is not supported for LSF."""
+    raise NotImplementedError('LSF does not support stopping instances. '
+                              'Use terminate_instances instead.')
+
+
+@timeline.event
+def terminate_instances(
+    cluster_name_on_cloud: str,
+    provider_config: Dict[str, Any],
+    worker_only: bool = False,
+) -> None:
+    """Terminate LSF job(s) for the cluster."""
+    del worker_only  # LSF jobs are all-or-nothing
+
+    client = _get_client(provider_config)
+    client.cancel_jobs_by_name(cluster_name_on_cloud)
+    logger.info(f'Terminated LSF jobs for {cluster_name_on_cloud}')
+
+
+def cleanup_cluster_resources(
+    cluster_name_on_cloud: str,
+    provider_config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Cleanup cluster resources. No-op for LSF (no auxiliary resources)."""
+    pass
+
+
+def _sky_cluster_home_dir(base_dir: str, cluster_name_on_cloud: str) -> str:
+    """Returns SkyPilot's home directory for this cluster on the LSF node."""
+    return f'{base_dir}/.sky_clusters/{cluster_name_on_cloud}'
+
+
+def _skypilot_runtime_dir(sky_base_dir: str,
+                          cluster_name_on_cloud: str) -> str:
+    """Returns the SkyPilot runtime directory on the LSF cluster.
+
+    Uses the shared workdir (not tmpdir) so it's accessible from login nodes.
+    """
+    return os.path.join(sky_base_dir, '.sky_clusters',
+                        cluster_name_on_cloud)
+
+
+def get_command_runners(
+    cluster_info: common.ClusterInfo,
+    **credentials: Any,
+) -> List[command_runner.LsfCommandRunner]:
+    """Get command runners for each instance in the cluster.
+
+    For LSF, commands are routed through the login node via SSH.
+    Uses LsfCommandRunner which handles the banned rsync wrapper
+    by specifying --rsync-path to the real rsync binary.
+    """
+    del credentials  # Use provider_config SSH info instead
+
+    assert cluster_info.provider_config is not None, cluster_info
+    provider_config = cluster_info.provider_config
+    ssh_config = provider_config.get('ssh', {})
+
+    if cluster_info.head_instance_id is None:
+        return []
+
+    head_instance = cluster_info.get_head_instance()
+    assert head_instance is not None, 'Head instance not found'
+    cluster_name_on_cloud = head_instance.tags.get(
+        provision_constants.TAG_SKYPILOT_CLUSTER_NAME, None)
+    assert cluster_name_on_cloud is not None, cluster_info
+
+    instances = [
+        instance_infos[0] for instance_infos in cluster_info.instances.values()
+    ]
+
+    login_node_ssh_hostname = ssh_config.get('hostname', '')
+    login_node_ssh_port = int(ssh_config.get('port', 22))
+    login_node_ssh_user = ssh_config.get('user', '')
+    login_node_ssh_private_key = ssh_config.get('private_key', None)
+    login_node_ssh_proxy_command = ssh_config.get('proxy_command', None)
+    login_node_ssh_proxy_jump = ssh_config.get('proxy_jump', None)
+
+    ssh_control_name = command_runner.DEFAULT_SSH_CONTROL_NAME
+
+    lsf_cluster_name = provider_config.get('cluster')
+    workdir = lsf_utils.get_workdir(lsf_cluster_name) if lsf_cluster_name else None
+    tmpdir = lsf_utils.get_tmpdir(lsf_cluster_name) if lsf_cluster_name else None
+
+    # Expand $USER in paths
+    if tmpdir and '$USER' in tmpdir:
+        tmpdir = tmpdir.replace('$USER', login_node_ssh_user)
+
+    sky_base_dir = workdir if workdir is not None else f'/home/{login_node_ssh_user}'
+    sky_cluster_home_dir = _sky_cluster_home_dir(sky_base_dir,
+                                                  cluster_name_on_cloud)
+
+    # Enable dispatch mode when container is active — routes commands
+    # to the compute node via the shared-FS dispatcher in the container.
+    image_id = provider_config.get('image_id')
+    enroot_enabled = provider_config.get('enroot', {}).get('enabled', False)
+    dispatch_dir = None
+    if image_id and enroot_enabled:
+        dispatch_dir = f'{sky_cluster_home_dir}/.sky/dispatch'
+
+    runners = [
+        command_runner.LsfCommandRunner(
+            (instance_info.external_ip or login_node_ssh_hostname,
+             instance_info.ssh_port),
+            login_node_ssh_user,
+            login_node_ssh_private_key,
+            sky_dir=sky_cluster_home_dir,
+            skypilot_runtime_dir=_skypilot_runtime_dir(
+                sky_base_dir, cluster_name_on_cloud),
+            ssh_proxy_command=login_node_ssh_proxy_command,
+            ssh_proxy_jump=login_node_ssh_proxy_jump,
+            ssh_control_name=ssh_control_name,
+            disable_identities_only=True,
+            dispatch_dir=dispatch_dir,
+        ) for instance_info in instances
+    ]
+
+    return runners
+
+
+def open_ports(
+    cluster_name_on_cloud: str,
+    ports: List[str],
+    provider_config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Open ports — not supported on LSF."""
+    del cluster_name_on_cloud, ports, provider_config
+
+
+def cleanup_ports(
+    cluster_name_on_cloud: str,
+    ports: List[str],
+    provider_config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Cleanup ports — not supported on LSF."""
+    del cluster_name_on_cloud, ports, provider_config

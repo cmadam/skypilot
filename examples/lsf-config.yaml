@@ -1,0 +1,32 @@
+# Reference ~/.sky/config.yaml for an LSF cluster with enroot containers
+# Copy to ~/.sky/config.yaml and replace placeholder values.
+lsf:
+  allowed_clusters:
+    - mycluster
+  cluster_configs:
+    mycluster:
+      # Working directory on shared filesystem (SkyPilot stores cluster state here)
+      workdir: /shared/fs/skypilot
+      # Temp directory (fast local storage preferred)
+      tmpdir: /opt/nvme/$USER/skypilot-tmp
+      enroot:
+        enabled: true
+        # Shared path for .sqsh images and enroot caches
+        share_path: /shared/fs
+        use_local_nvme: true
+        squash_options: "-comp lz4 -Xhc -no-xattrs"
+      # Additional bind mounts for the enroot container
+      enroot_mounts:
+        - "/dev/shm /dev/shm"
+        - "/dev/infiniband /dev/infiniband"
+      # NCCL tuning (optional, for multi-GPU InfiniBand clusters)
+      # nccl_tuning_file: /shared/fs/nccl-tuning.sh
+      # Default bsub options applied to all jobs
+      bsub_options:
+        G: my_lsf_group
+        M: 64G
+      # Per-queue overrides (e.g., preemptable queue requires a different group)
+      queue_configs:
+        preemptable:
+          bsub_options:
+            G: my_preemptable_group

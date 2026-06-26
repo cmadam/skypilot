@@ -1066,3 +1066,220 @@ class SlurmCodeGen(TaskCodeGen):
                 returncodes = [0]
             """),
         ]
+
+
+class LsfCodeGen(TaskCodeGen):
+    """Code generator for task execution on LSF via direct subprocess.
+
+    When container_dispatch_dir is set, user commands are dispatched to a
+    container running on the compute node via shared-filesystem protocol:
+    write cmd_<seq>.sh → dispatcher executes → poll rc_<seq> for result.
+    """
+
+    def __init__(self, container_dispatch_dir: Optional[str] = None) -> None:
+        super().__init__()
+        self.container_dispatch_dir = container_dispatch_dir
+
+    def add_prologue(self, job_id: int) -> None:
+        assert not self._has_prologue, 'add_prologue() called twice?'
+        self._has_prologue = True
+        self.job_id = job_id
+
+        self._add_common_imports()
+        self._code.append(
+            textwrap.dedent("""\
+            import copy
+            import multiprocessing
+            import multiprocessing.pool
+            import shutil
+            import threading
+            import uuid
+            """))
+        self._add_skylet_imports()
+        self._add_constants()
+        self._add_logging_functions()
+
+        self._code += [
+            'autostop_lib.set_last_active_time_to_now()',
+            f'job_lib.set_status({job_id!r}, job_lib.JobStatus.PENDING)',
+        ]
+
+    def add_setup(
+        self,
+        num_nodes: int,
+        resources_dict: Dict[str, float],
+        stable_cluster_internal_ips: List[str],
+        env_vars: Dict[str, str],
+        log_dir: str,
+        setup_cmd: Optional[str] = None,
+    ) -> None:
+        assert self._has_prologue, 'Call add_prologue() before add_setup().'
+        self._has_setup = True
+        self._cluster_num_nodes = len(stable_cluster_internal_ips)
+        self._stable_cluster_ips = stable_cluster_internal_ips
+
+        self._add_waiting_for_resources_msg(num_nodes)
+
+        if setup_cmd is not None:
+            setup_script = self.build_task_bash_script(setup_cmd)
+            if self.container_dispatch_dir:
+                self._code.append(
+                    textwrap.dedent(f"""\
+                    setup_env = {{}}
+                    setup_env['{constants.SKYPILOT_NUM_NODES}'] = '1'
+                    setup_env['SKYPILOT_NODE_RANK'] = '0'
+                    setup_env['SKYPILOT_INTERNAL_JOB_ID'] = str({self.job_id!r})
+                    setup_log = os.path.expanduser(os.path.join({log_dir!r}, 'setup.log'))
+                    dispatch_dir = {self.container_dispatch_dir!r}
+                    seq = 'setup'
+                    cmd_path = os.path.join(dispatch_dir, f'cmd_{{seq}}.sh')
+                    env_lines = '\\n'.join(f'export {{k}}=\"{{v}}\"' for k, v in setup_env.items())
+                    with open(cmd_path, 'w') as f:
+                        f.write(env_lines + '\\n' + {setup_script!r})
+                    rc_path = os.path.join(dispatch_dir, f'rc_{{seq}}')
+                    out_path = os.path.join(dispatch_dir, f'out_{{seq}}.log')
+                    while not os.path.exists(rc_path):
+                        time.sleep(0.5)
+                    with open(rc_path) as f:
+                        setup_rc = int(f.read().strip())
+                    os.makedirs(os.path.dirname(setup_log), exist_ok=True)
+                    shutil.copy(out_path, setup_log)
+                    if setup_rc != 0:
+                        job_lib.set_status({self.job_id!r}, job_lib.JobStatus.FAILED_SETUP)
+                        print(f'ERROR: Setup failed with return code {{setup_rc}}', flush=True)
+                        sys.exit(1)
+                    """))
+            else:
+                self._code.append(
+                    textwrap.dedent(f"""\
+                    setup_env = {{}}
+                    setup_env['{constants.SKYPILOT_NUM_NODES}'] = '1'
+                    setup_env['SKYPILOT_NODE_RANK'] = '0'
+                    setup_env['SKYPILOT_INTERNAL_JOB_ID'] = str({self.job_id!r})
+                    setup_log = os.path.expanduser(os.path.join({log_dir!r}, 'setup.log'))
+                    setup_rc = run_bash_command_with_log(
+                        {setup_script!r},
+                        setup_log,
+                        env_vars=setup_env,
+                        stream_logs=True)
+                    if setup_rc != 0:
+                        job_lib.set_status({self.job_id!r}, job_lib.JobStatus.FAILED_SETUP)
+                        print(f'ERROR: Setup failed with return code {{setup_rc}}', flush=True)
+                        sys.exit(1)
+                    """))
+
+    def add_task(
+        self,
+        num_nodes: int,
+        bash_script: Optional[str],
+        task_name: Optional[str],
+        resources_dict: Dict[str, float],
+        log_dir: str,
+        env_vars: Optional[Dict[str, str]] = None,
+    ) -> None:
+        assert self._has_setup, 'Call add_setup() before add_task().'
+        env_vars = env_vars or {}
+        task_name = task_name if task_name is not None else 'task'
+
+        acc_name, acc_count = self._get_accelerator_details(resources_dict)
+        num_gpus = 0
+        if (acc_name is not None and
+                not accelerator_registry.is_schedulable_non_gpu_accelerator(
+                    acc_name)):
+            num_gpus = int(math.ceil(acc_count))
+
+        task_bash_script = (self.build_task_bash_script(bash_script or '')
+                            if bash_script else '')
+        streaming_msg = self._get_job_started_msg()
+
+        sky_env_vars_dict_str = [
+            textwrap.dedent(f"""\
+            sky_env_vars_dict = {{}}
+            sky_env_vars_dict['SKYPILOT_INTERNAL_JOB_ID'] = {self.job_id}
+            """)
+        ]
+        if env_vars:
+            sky_env_vars_dict_str.extend(f'sky_env_vars_dict[{k!r}] = {v!r}'
+                                         for k, v in env_vars.items())
+        sky_env_vars_dict_str = '\n'.join(sky_env_vars_dict_str)
+
+        if self.container_dispatch_dir:
+            self._code += [
+                f'print({streaming_msg!r}, flush=True)',
+                f'job_lib.set_job_started({self.job_id!r})',
+                'job_lib.scheduler.schedule_step()',
+                sky_env_vars_dict_str,
+                textwrap.dedent(f"""\
+                script = {task_bash_script!r}
+
+                if script:
+                    sky_env_vars_dict['{constants.SKYPILOT_NUM_GPUS_PER_NODE}'] = {num_gpus}
+                    sky_env_vars_dict['SKYPILOT_NODE_RANK'] = 0
+                    sky_env_vars_dict['SKYPILOT_NODE_IPS'] = '127.0.0.1'
+                    sky_env_vars_dict['{constants.SKYPILOT_NUM_NODES}'] = 1
+
+                    dispatch_dir = {self.container_dispatch_dir!r}
+                    seq = str(uuid.uuid4())[:8]
+                    cmd_path = os.path.join(dispatch_dir, f'cmd_{{seq}}.sh')
+                    env_lines = '\\n'.join(f'export {{k}}=\"{{v}}\"' for k, v in sky_env_vars_dict.items())
+                    with open(cmd_path, 'w') as f:
+                        f.write(env_lines + '\\n' + script)
+
+                    log_path = os.path.expanduser(os.path.join({log_dir!r}, 'run.log'))
+                    rc_path = os.path.join(dispatch_dir, f'rc_{{seq}}')
+                    out_path = os.path.join(dispatch_dir, f'out_{{seq}}.log')
+
+                    # Stream output in real-time while waiting for completion
+                    last_pos = 0
+                    while not os.path.exists(rc_path):
+                        if os.path.exists(out_path):
+                            with open(out_path) as f:
+                                f.seek(last_pos)
+                                new_data = f.read()
+                                if new_data:
+                                    print(new_data, end='', flush=True)
+                                    last_pos = f.tell()
+                        time.sleep(0.5)
+                    # Flush any remaining output after command completes
+                    if os.path.exists(out_path):
+                        with open(out_path) as f:
+                            f.seek(last_pos)
+                            remaining = f.read()
+                            if remaining:
+                                print(remaining, end='', flush=True)
+
+                    with open(rc_path) as f:
+                        return_code = int(f.read().strip())
+                    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                    shutil.copy(out_path, log_path)
+                    returncodes = [return_code]
+                else:
+                    returncodes = [0]
+                """),
+            ]
+        else:
+            self._code += [
+                f'print({streaming_msg!r}, flush=True)',
+                f'job_lib.set_job_started({self.job_id!r})',
+                'job_lib.scheduler.schedule_step()',
+                sky_env_vars_dict_str,
+                textwrap.dedent(f"""\
+                script = {task_bash_script!r}
+
+                if script:
+                    sky_env_vars_dict['{constants.SKYPILOT_NUM_GPUS_PER_NODE}'] = {num_gpus}
+                    sky_env_vars_dict['SKYPILOT_NODE_RANK'] = 0
+                    sky_env_vars_dict['SKYPILOT_NODE_IPS'] = '127.0.0.1'
+                    sky_env_vars_dict['{constants.SKYPILOT_NUM_NODES}'] = 1
+
+                    log_path = os.path.expanduser(os.path.join({log_dir!r}, 'run.log'))
+                    result = run_bash_command_with_log_and_return_pid(
+                        script,
+                        log_path,
+                        env_vars=sky_env_vars_dict,
+                        stream_logs=True)
+                    returncodes = [int(result.get('return_code', 1))]
+                else:
+                    returncodes = [0]
+                """),
+            ]

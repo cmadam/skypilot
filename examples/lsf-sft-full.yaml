@@ -1,0 +1,90 @@
+# SkyPilot task: Open Instruct SFT training on BlueVela (full dataset)
+# Uses pre-tokenized data directly (skips tokenization stage).
+#
+# Usage:
+#   sky launch --cloud lsf -c sft-full examples/lsf-sft-full.yaml
+
+resources:
+  cloud: lsf
+  accelerators: H100:8
+  # Match gbansible bluevela_openinstruct_sft_job default bv_memory=1.5T (per-host
+  # via #BSUB -hl). Provisioner emits `#BSUB -M {memory}G`, so 1536 GB ≈ 1.5 TB.
+  memory: 1536
+  image_id: docker://us.icr.io/cil15-shared-registry/open-instruct-tuning:0.1.0-conda
+
+run: |
+  set -e
+  echo "=== SFT Training (full dataset) on $(hostname) ==="
+  echo "GPU check:"
+  nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+  # ─── Paths ───────────────────────────────────────────────────────────────
+  DATASET_DIR="/proj/granite-build/g4os/datasets/tokenized/all_combined/tokenized/8192/data_filtered"
+  MODEL_PATH="/proj/granite-build/g4os/granite-4.0-350m-base/r251014a"
+  CHAT_TEMPLATE_PATH="/proj/granite-build/g4os/chat_template.jinja"
+  OUTPUT_DIR="/proj/granite-build/g4os/skypilot-test/sft/checkpoints"
+
+  # Verify dataset exists
+  if [ ! -f "$DATASET_DIR/state.json" ]; then
+    echo "ERROR: Dataset not found at $DATASET_DIR"
+    exit 1
+  fi
+  echo "Using dataset: $DATASET_DIR"
+
+  # ─── Environment ────────────────────────────────────────────────────────
+  export PYTHONPATH="/stage"
+  export OMP_NUM_THREADS=1
+  export CUDA_DEVICE_ORDER="PCI_BUS_ID"
+  export CUDA_MODULE_LOADING="LAZY"
+  export CUDA_DEVICE_MAX_CONNECTIONS=1
+  export TORCHINDUCTOR_REORDER_FOR_PEAK_MEMORY=1
+
+  TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+  RUN_OUTPUT_DIR="$OUTPUT_DIR/v0-$(date +%Y%m%d)-${TIMESTAMP}"
+  mkdir -p "$OUTPUT_DIR"
+
+  echo ""
+  echo "=== Starting SFT training ==="
+  echo "  Model:   $MODEL_PATH"
+  echo "  Dataset: $DATASET_DIR"
+  echo "  Output:  $RUN_OUTPUT_DIR"
+  echo "  Epochs:  3"
+  echo "  GPUs:    8"
+  echo ""
+
+  cd /stage
+  accelerate launch \
+    --mixed_precision bf16 \
+    --num_machines 1 \
+    --num_processes 8 \
+    --machine_rank 0 \
+    --main_process_ip localhost \
+    --main_process_port ${MASTER_PORT:-29500} \
+    --config_file /stage/configs/fsdp_accelerate_mamba.yaml \
+    open_instruct/finetune.py \
+    --model_name_or_path "$MODEL_PATH" \
+    --per_device_train_batch_size 8 \
+    --gradient_accumulation_steps 4 \
+    --learning_rate 1e-5 \
+    --lr_scheduler_type linear \
+    --warmup_ratio 0.03 \
+    --weight_decay 0.0 \
+    --num_train_epochs 3 \
+    --output_dir "$RUN_OUTPUT_DIR" \
+    --logging_steps 1 \
+    --reduce_loss sum \
+    --tokenized_data "$DATASET_DIR" \
+    --keep_last_n_checkpoints 5 \
+    --checkpointing_steps epoch \
+    --exp_name "skypilot-sft-full_${TIMESTAMP}" \
+    --seed 123 \
+    --clip_grad_norm 1.0 \
+    --max_seq_len 8192 \
+    --hf_dir "${RUN_OUTPUT_DIR}-hf" \
+    --use_flash_attn \
+    --gradient_checkpointing \
+    --use_fast \
+    --padfree \
+    --no_push_to_hub \
+    --no_try_launch_beaker_eval_jobs \
+    --chat_template "$CHAT_TEMPLATE_PATH"
