@@ -1960,6 +1960,7 @@ class LsfCommandRunner(SSHCommandRunner):
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
+        timeout: Optional[int] = None,
     ) -> None:
         """Rsync with --rsync-path to bypass banned rsync wrapper on remote."""
         if self._docker_ssh_proxy_command is not None:
@@ -1985,7 +1986,8 @@ class LsfCommandRunner(SSHCommandRunner):
             rsh_option=rsh_option,
             log_path=log_path,
             stream_logs=stream_logs,
-            max_retry=max_retry)
+            max_retry=max_retry,
+            timeout=timeout)
 
     def _rsync_with_path(
         self,
@@ -1997,6 +1999,7 @@ class LsfCommandRunner(SSHCommandRunner):
         log_path: str = os.devnull,
         stream_logs: bool = True,
         max_retry: int = 1,
+        timeout: Optional[int] = None,
     ) -> None:
         """Like _rsync but injects --rsync-path for the remote binary."""
         rsync_command = ['rsync', RSYNC_DISPLAY_OPTION]
