@@ -33,6 +33,13 @@ LSF_TERMINAL_STATES = {LSF_STATE_DONE, LSF_STATE_EXIT}
 # Suspended states
 LSF_SUSPENDED_STATES = {LSF_STATE_PSUSP, LSF_STATE_USUSP, LSF_STATE_SSUSP}
 
+# Markers echoed by compute-node feature probes. We match on these instead of
+# the exit code because `lsrun` returns a non-zero code both when the probed
+# feature is missing and when the dispatch itself failed, and those two cases
+# must be told apart.
+_PROBE_OK = 'GB_LSF_PROBE_OK'
+_PROBE_MISSING = 'GB_LSF_PROBE_MISSING'
+
 
 class LsfQueue(NamedTuple):
     """Information about an LSF queue."""
@@ -668,15 +675,50 @@ class LsfClient:
             job_ids = [j for j in job_ids if j != exclude_job_id]
         return len(job_ids)
 
-    def check_enroot_available(self) -> bool:
-        """Check if enroot is available on the cluster.
+    def _probe_on_node(self, node: Optional[str],
+                       test_cmd: str) -> Optional[bool]:
+        """Run a feature test on a compute node via `lsrun`.
+
+        LSF commands are issued from the submit (login) host, which on many
+        clusters does not have the same software installed as the compute
+        nodes that actually run jobs. Feature probes are therefore dispatched
+        to a compute node instead of being run locally.
+
+        Args:
+            node: The compute node to probe. If None, no probe is attempted.
+            test_cmd: A shell command that succeeds iff the feature exists.
 
         Returns:
-            True if enroot is installed and accessible.
+            True/False if the probe reported an answer, None if it was
+            inconclusive (no node available, `lsrun` unusable, host down).
         """
-        cmd = 'which enroot'
-        rc, _, _ = self._run_lsf_cmd(cmd)
-        return rc == 0
+        if node is None:
+            return None
+        script = (f'if {test_cmd} >/dev/null 2>&1; then echo {_PROBE_OK}; '
+                  f'else echo {_PROBE_MISSING}; fi')
+        cmd = (f'lsrun -m {shlex.quote(node)} '
+               f'/bin/sh -c {shlex.quote(script)}')
+        _, stdout, stderr = self._run_lsf_cmd(cmd)
+        if _PROBE_OK in stdout:
+            return True
+        if _PROBE_MISSING in stdout:
+            return False
+        logger.debug(f'Inconclusive LSF probe on {node}: {test_cmd!r} '
+                     f'(stdout={stdout.strip()!r} stderr={stderr.strip()!r})')
+        return None
+
+    def check_enroot_available(
+            self, node: Optional[str] = None) -> Optional[bool]:
+        """Check if enroot is available on a compute node.
+
+        Args:
+            node: The compute node to probe.
+
+        Returns:
+            True if enroot is installed and accessible, False if it is
+            missing, None if the check was inconclusive.
+        """
+        return self._probe_on_node(node, 'command -v enroot')
 
     def check_dir_shared_fs(self, path: str) -> Optional[str]:
         """Check the filesystem type of a directory.
@@ -731,15 +773,18 @@ class LsfClient:
                 stderr=f'{stdout}\n{stderr}')
         return rc == 0
 
-    def check_fuse_enabled(self) -> bool:
-        """Check if FUSE is available on the cluster.
+    def check_fuse_enabled(self,
+                           node: Optional[str] = None) -> Optional[bool]:
+        """Check if FUSE is available on a compute node.
+
+        Args:
+            node: The compute node to probe.
 
         Returns:
-            True if FUSE is available, False otherwise.
+            True if FUSE is available, False if it is not, None if the check
+            was inconclusive.
         """
-        cmd = 'test -e /dev/fuse'
-        rc, _, _ = self._run_lsf_cmd(cmd)
-        return rc == 0
+        return self._probe_on_node(node, 'test -e /dev/fuse')
 
     def get_lsf_version(self) -> Optional[str]:
         """Get the LSF version string.

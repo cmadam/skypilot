@@ -82,14 +82,16 @@ class LSF(clouds.Cloud):
         if cluster is not None:
             if not lsf_utils.check_enroot_enabled(cluster):
                 unsupported[clouds.CloudImplementationFeatures.DOCKER_IMAGE] = (
-                    'Docker image support requires enroot on the LSF cluster. '
-                    f'Cluster {cluster!r} does not have enroot installed.')
+                    'Docker image support on LSF requires enroot. Set '
+                    f'lsf.cluster_configs.{cluster}.enroot.enabled: true and '
+                    'make sure enroot is installed on the compute nodes.')
 
             if not lsf_utils.check_fuse_enabled(cluster):
                 unsupported[
                     clouds.CloudImplementationFeatures.STORAGE_MOUNTING] = (
-                        'Storage mounting requires FUSE on the LSF cluster. '
-                        f'Cluster {cluster!r} does not have FUSE available.')
+                        'Storage mounting requires FUSE on the LSF compute '
+                        f'nodes. Cluster {cluster!r} does not have FUSE '
+                        'available.')
 
         return unsupported
 

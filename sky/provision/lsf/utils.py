@@ -211,13 +211,45 @@ def get_lsf_nodes_info(cluster: str) -> List[lsf.NodeInfo]:
     return nodes_info
 
 
+def _pick_probe_node(cluster: str) -> Optional[str]:
+    """Pick a compute node to run feature-detection commands on.
+
+    Feature probes must not run on the submit (login) host, which often does
+    not have the same software installed as the nodes that run jobs. GPU nodes
+    are preferred since they are where containerized workloads land; master
+    and other non-compute hosts report zero GPUs.
+
+    Returns:
+        A node name, or None if no suitable node could be determined.
+    """
+    try:
+        nodes = get_lsf_nodes_info(cluster)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Failed to list nodes for LSF cluster {cluster}: '
+                     f'{common_utils.format_exception(e)}')
+        return None
+    ok_nodes = [n for n in nodes if n.status == 'ok']
+    for node in ok_nodes:
+        if node.gpus > 0:
+            return node.node
+    if ok_nodes:
+        return ok_nodes[0].node
+    return None
+
+
 def _check_cluster_feature(
     cluster: str,
     feature_name: str,
-    check_fn: Callable[[lsf.LsfClient], bool],
+    check_fn: Callable[[lsf.LsfClient], Optional[bool]],
     cache_ttl: int,
+    default_if_unknown: bool = False,
 ) -> bool:
-    """Check if a feature is available on an LSF cluster, with caching."""
+    """Check if a feature is available on an LSF cluster, with caching.
+
+    Args:
+        default_if_unknown: What to report when the check is inconclusive.
+            Inconclusive results are not cached, so a later launch retries.
+    """
     cache_key = f'lsf:{feature_name}_enabled:{cluster}'
     cached = kv_cache.get_cache_entry(cache_key)
     if cached is not None:
@@ -226,6 +258,10 @@ def _check_cluster_feature(
 
     client = _create_lsf_client(cluster)
     enabled = check_fn(client)
+    if enabled is None:
+        logger.debug(f'LSF {feature_name} check on {cluster} was '
+                     f'inconclusive; assuming {default_if_unknown}')
+        return default_if_unknown
 
     try:
         kv_cache.add_or_update_cache_entry(cache_key,
@@ -239,17 +275,33 @@ def _check_cluster_feature(
 
 
 def check_enroot_enabled(cluster: str) -> bool:
-    """Check if enroot is available on an LSF cluster."""
-    return _check_cluster_feature(cluster, 'enroot',
-                                  lambda c: c.check_enroot_available(),
-                                  _LSF_ENROOT_CHECK_CACHE_TTL)
+    """Check if enroot can be used on an LSF cluster.
+
+    Config is authoritative: provisioning only invokes enroot when
+    `lsf.cluster_configs.<cluster>.enroot.enabled` is set (see
+    LSF.make_deploy_resources_variables), so a cluster that does not declare
+    it cannot use containers regardless of what is installed. When it is
+    declared, verify on a compute node -- never on the submit host, which may
+    not have enroot even though the compute nodes do.
+    """
+    if not get_enroot_config(cluster)['enabled']:
+        return False
+    return _check_cluster_feature(
+        cluster,
+        'enroot_compute',
+        lambda c: c.check_enroot_available(node=_pick_probe_node(cluster)),
+        _LSF_ENROOT_CHECK_CACHE_TTL,
+        default_if_unknown=True)
 
 
 def check_fuse_enabled(cluster: str) -> bool:
-    """Check if FUSE is available on an LSF cluster."""
-    return _check_cluster_feature(cluster, 'fuse',
-                                  lambda c: c.check_fuse_enabled(),
-                                  _LSF_FUSE_CHECK_CACHE_TTL)
+    """Check if FUSE is available on an LSF cluster's compute nodes."""
+    return _check_cluster_feature(
+        cluster,
+        'fuse_compute',
+        lambda c: c.check_fuse_enabled(node=_pick_probe_node(cluster)),
+        _LSF_FUSE_CHECK_CACHE_TTL,
+        default_if_unknown=True)
 
 
 def get_all_lsf_cluster_names() -> List[str]:
