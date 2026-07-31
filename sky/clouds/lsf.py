@@ -358,6 +358,12 @@ class LSF(clouds.Cloud):
         # Get enroot config
         enroot_config = lsf_utils.get_enroot_config(cluster)
 
+        # Launch-phase timeouts. Resolved here rather than in the provisioner
+        # so the queue-level override is applied with the queue we actually
+        # submit to.
+        provision_timeout = lsf_utils.get_provision_timeout(cluster, queue)
+        ready_timeout = lsf_utils.get_ready_timeout(cluster, queue)
+
         deploy_vars = {
             'instance_type': resources.instance_type,
             'cpus': str(inst.cpus),
@@ -380,6 +386,8 @@ class LSF(clouds.Cloud):
             'image_id': (list(resources.image_id.values())[0]
                         if resources.image_id else ''),
             'bsub_options': bsub_options,
+            'provision_timeout': str(provision_timeout),
+            'ready_timeout': str(ready_timeout),
             'enroot_enabled': str(enroot_config['enabled']),
             'enroot_share_path': enroot_config['share_path'],
             'enroot_use_local_nvme': str(enroot_config['use_local_nvme']),

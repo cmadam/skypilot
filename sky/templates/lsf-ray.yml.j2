@@ -37,6 +37,10 @@ provider:
   image_id: "{{image_id}}"
 {% endif %}
 
+  # Launch-phase timeouts, in seconds (negative = wait indefinitely)
+  provision_timeout: "{{provision_timeout}}"
+  ready_timeout: "{{ready_timeout}}"
+
   # Enroot container configuration
   enroot_enabled: "{{enroot_enabled}}"
   enroot_share_path: "{{enroot_share_path}}"

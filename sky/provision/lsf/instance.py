@@ -26,8 +26,6 @@ from sky.utils import timeline
 
 logger = sky_logging.init_logger(__name__)
 
-# How long to wait for a job to get allocated (seconds)
-_DEFAULT_PROVISION_TIMEOUT = 1800
 _POLL_INTERVAL = 5
 
 
@@ -662,15 +660,24 @@ def run_instances(
     )
     logger.info(f'Submitted LSF job {job_id} for {cluster_name_on_cloud}')
 
-    # Wait for job to get nodes allocated
-    nodes = _wait_for_job_nodes(client, job_id, cluster_name_on_cloud)
+    # Wait for job to get nodes allocated. The timeouts are resolved by
+    # sky/clouds/lsf.py (which knows the queue) and passed through the
+    # provider config; fall back to the defaults for clusters provisioned by
+    # an older config that predates these keys.
+    provision_timeout = _get_timeout(provider_config, 'provision_timeout',
+                                     lsf_utils.DEFAULT_PROVISION_TIMEOUT)
+    nodes = _wait_for_job_nodes(client, job_id, cluster_name_on_cloud,
+                                provision_timeout)
     instance_ids = [lsf_utils.instance_id(job_id, n) for n in nodes]
 
     # Wait for bsub script to signal readiness (includes container setup)
     image_id = provider_config.get('image_id', '')
     enroot_enabled = provider_config.get('enroot_enabled', 'False') == 'True'
     if image_id and enroot_enabled:
-        _wait_for_ready_signal(runner, ready_file, cluster_name_on_cloud)
+        ready_timeout = _get_timeout(provider_config, 'ready_timeout',
+                                     lsf_utils.DEFAULT_READY_TIMEOUT)
+        _wait_for_ready_signal(runner, ready_file, cluster_name_on_cloud,
+                               ready_timeout)
 
     return common.ProvisionRecord(
         provider_name='lsf',
@@ -683,14 +690,41 @@ def run_instances(
     )
 
 
+def _get_timeout(provider_config: Dict[str, Any], key: str,
+                 default: int) -> int:
+    """Read a timeout (seconds) from the provider config.
+
+    The value arrives as a string via the Jinja-rendered cluster YAML.
+    """
+    value = provider_config.get(key)
+    if value is None or value == '':
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(f'Ignoring non-integer {key} {value!r} in LSF provider '
+                       f'config; using {default}s.')
+        return default
+
+
+def _wait_str(timeout: int) -> str:
+    return 'indefinitely' if timeout < 0 else f'up to {timeout}s'
+
+
 def _wait_for_job_nodes(client: lsf_adaptor.LsfClient,
                         job_id: str,
                         cluster_name: str,
-                        timeout: int = _DEFAULT_PROVISION_TIMEOUT
+                        timeout: int = lsf_utils.DEFAULT_PROVISION_TIMEOUT
                         ) -> List[str]:
-    """Wait until an LSF job has nodes allocated."""
+    """Wait until an LSF job has nodes allocated.
+
+    A negative timeout waits indefinitely. Note that a pending job is the
+    normal state on a busy queue, so this can legitimately block for hours.
+    """
+    logger.info(f'Waiting {_wait_str(timeout)} for LSF job {job_id} '
+                f'({cluster_name}) to be allocated nodes.')
     start_time = time.time()
-    while time.time() - start_time < timeout:
+    while timeout < 0 or time.time() - start_time < timeout:
         state = client.get_job_state(job_id)
         if state is None:
             raise RuntimeError(
@@ -714,12 +748,20 @@ def _wait_for_job_nodes(client: lsf_adaptor.LsfClient,
         f'to get nodes allocated after {timeout}s.')
 
 
-def _wait_for_ready_signal(runner, ready_file: str, cluster_name: str,
-                           timeout: int = 600) -> None:
-    """Wait for the bsub script to signal readiness via a file on shared FS."""
-    logger.info(f'Waiting for container readiness: {ready_file}')
+def _wait_for_ready_signal(runner,
+                           ready_file: str,
+                           cluster_name: str,
+                           timeout: int = lsf_utils.DEFAULT_READY_TIMEOUT
+                           ) -> None:
+    """Wait for the bsub script to signal readiness via a file on shared FS.
+
+    A negative timeout waits indefinitely. This window covers the step image's
+    `enroot import`, which is slow on a cold cache.
+    """
+    logger.info(f'Waiting {_wait_str(timeout)} for container readiness: '
+                f'{ready_file}')
     start_time = time.time()
-    while time.time() - start_time < timeout:
+    while timeout < 0 or time.time() - start_time < timeout:
         rc, _, _ = runner.run(
             f'test -f {shlex.quote(ready_file)}',
             require_outputs=True, separate_stderr=True, stream_logs=False)

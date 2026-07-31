@@ -2120,6 +2120,9 @@ def get_config_schema():
                 'provision_timeout': {
                     'type': 'integer',
                 },
+                'ready_timeout': {
+                    'type': 'integer',
+                },
                 'pricing': _PRICING_SCHEMA,
                 'cluster_configs': {
                     'type': 'object',
@@ -2135,6 +2138,13 @@ def get_config_schema():
                             },
                             'tmpdir': {
                                 'type': 'string',
+                            },
+                            # Negative means wait indefinitely.
+                            'provision_timeout': {
+                                'type': 'integer',
+                            },
+                            'ready_timeout': {
+                                'type': 'integer',
                             },
                             'pricing': _PRICING_SCHEMA,
                             'bsub_options': {
@@ -2181,6 +2191,13 @@ def get_config_schema():
                                     'required': [],
                                     'additionalProperties': False,
                                     'properties': {
+                                        # Negative means wait indefinitely.
+                                        'provision_timeout': {
+                                            'type': 'integer',
+                                        },
+                                        'ready_timeout': {
+                                            'type': 'integer',
+                                        },
                                         'pricing': _PRICING_SCHEMA,
                                         'bsub_options': {
                                             'type': 'object',

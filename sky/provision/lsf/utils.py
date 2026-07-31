@@ -26,6 +26,22 @@ _LSF_NODES_INFO_CACHE_TTL = 30 * 60
 _LSF_ENROOT_CHECK_CACHE_TTL = 24 * 60 * 60
 _LSF_FUSE_CHECK_CACHE_TTL = 24 * 60 * 60
 
+# How long to wait for LSF to allocate nodes to a submitted job. Generous by
+# design: the LSF backend always pins a queue (SkyPilot's `zone`), so there is
+# no other zone to fail over to, and abandoning the wait only forfeits the
+# job's place in the queue — the next attempt is resubmitted at the back of it.
+# On a busy shared queue a wait of hours is normal, not a fault. This mirrors
+# the Slurm backend, which uses the same 24h value whenever a partition is
+# pinned (see `sky/clouds/slurm.py`). Override per cluster or per queue with
+# `lsf.cluster_configs.<cluster>.provision_timeout` (negative = indefinitely).
+DEFAULT_PROVISION_TIMEOUT = 24 * 60 * 60
+
+# How long to wait, once nodes are allocated, for the bsub script to signal
+# container readiness. This window covers `enroot import` of the step image,
+# which on a cold cache means squashing a multi-GB image onto shared storage.
+# Override with `lsf.cluster_configs.<cluster>.ready_timeout`.
+DEFAULT_READY_TIMEOUT = 60 * 60
+
 
 class LsfInstanceType:
     """Class to represent the "Instance Type" in an LSF cluster.
@@ -446,6 +462,57 @@ def get_bsub_options(cluster: str,
     merged.update(cluster_opts)
     merged.update(queue_opts)
     return merged
+
+
+def _get_timeout_config(cluster: str, queue: Optional[str], key: str,
+                        default: int) -> int:
+    """Read a launch-phase timeout from sky config with three-level merge.
+
+    Merges: global `lsf.<key>` < cluster-level < queue-level, so a queue whose
+    scheduling behaviour differs (e.g. `preemptable` vs `normal`) can override
+    the cluster default. A negative value means "wait indefinitely".
+    """
+    config_keys = [
+        ('lsf', key),
+        ('lsf', 'cluster_configs', cluster, key),
+    ]
+    if queue is not None:
+        config_keys.append(
+            ('lsf', 'cluster_configs', cluster, 'queue_configs', queue, key))
+
+    value = None
+    for keys in config_keys:
+        level_value = skypilot_config.get_nested(keys, None)
+        if level_value is not None:
+            value = level_value
+
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(f'Ignoring non-integer lsf {key} {value!r} for cluster '
+                       f'{cluster}; using {default}s.')
+        return default
+
+
+def get_provision_timeout(cluster: str, queue: Optional[str] = None) -> int:
+    """Seconds to wait for LSF to allocate nodes to a submitted job.
+
+    Negative means wait indefinitely. See DEFAULT_PROVISION_TIMEOUT for why
+    the default is generous.
+    """
+    return _get_timeout_config(cluster, queue, 'provision_timeout',
+                               DEFAULT_PROVISION_TIMEOUT)
+
+
+def get_ready_timeout(cluster: str, queue: Optional[str] = None) -> int:
+    """Seconds to wait for container readiness once nodes are allocated.
+
+    Negative means wait indefinitely.
+    """
+    return _get_timeout_config(cluster, queue, 'ready_timeout',
+                               DEFAULT_READY_TIMEOUT)
 
 
 def get_workdir(cluster: str) -> Optional[str]:
