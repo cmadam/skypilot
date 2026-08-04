@@ -37,6 +37,12 @@ _POLL_INTERVAL = 5
 # LsfContainerCommandRunner as shared_fs_roots and surfaced to the backend via
 # get_unwrapped_mount_prefixes. /tmp and /opt/nvme are node-local (not shared
 # across the login/compute split) and are intentionally excluded.
+#
+# TODO(drift): this list is maintained by hand alongside the identity mount
+# lines emitted in _build_enroot_block (the `echo "/proj /proj"` etc. block). If
+# those bind-mounts change and this is not updated in lockstep, file_mounts
+# silently break with no signal. Follow-up: derive both from one structured
+# source (e.g. a list of (path, is_shared) tuples) so they cannot desync.
 _SHARED_FS_ROOTS = ['/proj', '/opt/share']
 
 
