@@ -6242,6 +6242,19 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         style = colorama.Style
         start = time.time()
         runners = handle.get_command_runners()
+        # gbserver/LSF: destinations under a shared, container-visible bind-mount
+        # root (e.g. /proj on bluevela) are written directly on the login node
+        # (writable, sudo-free) and are visible to the containerized job at the
+        # identical path via the enroot identity bind-mount. Such destinations
+        # must NOT be sudo-symlink-wrapped — wrapping redirects them to
+        # ~/.sky/file_mounts/... and breaks that identity mapping. The LSF runner
+        # exposes these roots via get_unwrapped_mount_prefixes(); every other
+        # runner returns [] so behavior elsewhere is unchanged.
+        unwrapped_prefixes: List[str] = []
+        if runners:
+            unwrapped_prefixes = getattr(runners[0],
+                                         'get_unwrapped_mount_prefixes',
+                                         lambda: [])()
         log_path = os.path.join(self.log_dir, 'file_mounts.log')
         num_threads = subprocess_utils.get_max_workers_for_file_mounts(
             file_mounts, str(handle.launched_resources.cloud))
@@ -6280,7 +6293,11 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 dst = f'{SKY_REMOTE_WORKDIR}/{dst}'
             # Sync 'src' to 'wrapped_dst', a safe-to-write "wrapped" path.
             wrapped_dst = dst
-            if not dst.startswith('~/') and not dst.startswith('/tmp/'):
+            dst_is_shared = any(
+                dst == p or dst.startswith(p.rstrip('/') + '/')
+                for p in unwrapped_prefixes)
+            if (not dst.startswith('~/') and not dst.startswith('/tmp/') and
+                    not dst_is_shared):
                 # Handles the remote paths possibly without write access.
                 # (1) add <prefix> to these target paths.
                 wrapped_dst = backend_utils.FileMountHelper.wrap_file_mount(dst)

@@ -18,6 +18,7 @@ from sky.utils import status_lib
 from sky.adaptors import lsf as lsf_adaptor
 from sky.provision import common
 from sky.provision import constants as provision_constants
+from sky.provision.lsf import command_runner as lsf_command_runner
 from sky.provision.lsf import utils as lsf_utils
 from sky.skylet import constants
 from sky.utils import command_runner
@@ -27,6 +28,16 @@ from sky.utils import timeline
 logger = sky_logging.init_logger(__name__)
 
 _POLL_INTERVAL = 5
+
+# Shared network-filesystem roots that are bind-mounted *identity* into the
+# enroot container (see the mount lines emitted by _build_enroot_setup_block).
+# A file_mount destination under one of these is written directly on the
+# (sudo-less) login node and is visible to the containerized job at the same
+# path, so the backend must NOT symlink-wrap it. Passed to
+# LsfContainerCommandRunner as shared_fs_roots and surfaced to the backend via
+# get_unwrapped_mount_prefixes. /tmp and /opt/nvme are node-local (not shared
+# across the login/compute split) and are intentionally excluded.
+_SHARED_FS_ROOTS = ['/proj', '/opt/share']
 
 
 def _get_client(provider_config: Dict[str, Any]) -> lsf_adaptor.LsfClient:
@@ -941,8 +952,10 @@ def get_command_runners(
     """Get command runners for each instance in the cluster.
 
     For LSF, commands are routed through the login node via SSH.
-    Uses LsfCommandRunner which handles the banned rsync wrapper
-    by specifying --rsync-path to the real rsync binary.
+    Uses LsfContainerCommandRunner (a LsfCommandRunner subclass) which handles
+    the banned rsync wrapper by specifying --rsync-path to the real rsync
+    binary, and additionally routes container-HOME (``~``) file_mounts so they
+    are staged and copied into the enroot container (see that class).
     """
     del credentials  # Use provider_config SSH info instead
 
@@ -993,7 +1006,7 @@ def get_command_runners(
         dispatch_dir = f'{sky_cluster_home_dir}/.sky/dispatch'
 
     runners = [
-        command_runner.LsfCommandRunner(
+        lsf_command_runner.LsfContainerCommandRunner(
             (instance_info.external_ip or login_node_ssh_hostname,
              instance_info.ssh_port),
             login_node_ssh_user,
@@ -1006,6 +1019,7 @@ def get_command_runners(
             ssh_control_name=ssh_control_name,
             disable_identities_only=True,
             dispatch_dir=dispatch_dir,
+            shared_fs_roots=_SHARED_FS_ROOTS,
         ) for instance_info in instances
     ]
 
