@@ -338,6 +338,22 @@ class CommandRunner:
     def node_id(self) -> str:
         return '-'.join(str(x) for x in self.node)
 
+    def get_unwrapped_mount_prefixes(self) -> List[str]:
+        """Return file_mount destination prefixes exempt from symlink-wrapping.
+
+        The backend's ``_execute_file_mounts`` normally sudo-symlink-wraps every
+        absolute, non-``~/``/non-``/tmp/`` destination. A runner may override
+        this to declare shared, container-visible filesystem roots (e.g. ``/proj``
+        on the LSF/enroot backend, which are bind-mounted *identity* into the
+        container) whose destinations must be left un-wrapped so they persist at
+        the identical path the job reads.
+
+        :returns: absolute path prefixes to exempt. The base implementation
+            returns ``[]``, so every runner is un-exempt (behavior unchanged)
+            unless it explicitly overrides this.
+        """
+        return []
+
     def get_remote_home_dir(self) -> str:
         # Use pattern matching to extract home directory.
         # Some container images print MOTD when login shells start, which can

@@ -52,6 +52,9 @@ class LsfContainerCommandRunner(command_runner.LsfCommandRunner):
     def get_unwrapped_mount_prefixes(self) -> List[str]:
         """Return the shared-FS roots whose file_mounts must not be wrapped.
 
+        Overrides :meth:`sky.utils.command_runner.CommandRunner.get_unwrapped_mount_prefixes`
+        (which returns ``[]``) to declare this cluster's identity-mounted roots.
+
         Consumed by ``_execute_file_mounts`` in the backend: a destination equal
         to, or under, one of these prefixes bypasses ``make_safe_symlink_command``
         and is rsynced straight to the shared filesystem on the login node.

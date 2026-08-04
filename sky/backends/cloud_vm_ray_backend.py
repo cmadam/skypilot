@@ -6249,16 +6249,15 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # must NOT be sudo-symlink-wrapped — wrapping redirects them to
         # ~/.sky/file_mounts/... and breaks that identity mapping. The LSF runner
         # exposes these roots via get_unwrapped_mount_prefixes(); every other
-        # runner returns [] so behavior elsewhere is unchanged.
+        # runner returns [] (the CommandRunner base default) so behavior
+        # elsewhere is unchanged.
         unwrapped_prefixes: List[str] = []
         if runners:
             # Assumes a homogeneous runner set (true for LSF today): only
             # runners[0] is consulted, so if a heterogeneous set ever reaches
             # this cloud-agnostic path, prefixes from other runners are ignored.
             # Not worth iterating over all runners today.
-            unwrapped_prefixes = getattr(runners[0],
-                                         'get_unwrapped_mount_prefixes',
-                                         lambda: [])()
+            unwrapped_prefixes = runners[0].get_unwrapped_mount_prefixes()
         log_path = os.path.join(self.log_dir, 'file_mounts.log')
         num_threads = subprocess_utils.get_max_workers_for_file_mounts(
             file_mounts, str(handle.launched_resources.cloud))

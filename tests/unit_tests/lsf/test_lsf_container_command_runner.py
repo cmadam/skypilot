@@ -5,9 +5,10 @@ it records the shared network-filesystem roots (bind-mounted identity into the
 enroot container) and exposes them via ``get_unwrapped_mount_prefixes()``. The
 backend's ``_execute_file_mounts`` reads that list to decide which file_mount
 destinations skip the sudo-symlink-wrap. These tests lock in that contract and,
-crucially, the "behavior elsewhere is unchanged" guarantee: the base runner does
-not expose the method, so the backend's ``getattr(..., lambda: [])`` fallback
-yields ``[]`` for every non-LSF-container runner.
+crucially, the "behavior elsewhere is unchanged" guarantee: the CommandRunner
+base class defines get_unwrapped_mount_prefixes() returning ``[]``, so every
+non-LSF-container runner exempts nothing. That guarantee is now structural (a
+base method) rather than tested-by-absence.
 """
 
 from sky.provision.lsf.command_runner import LsfContainerCommandRunner
@@ -84,21 +85,21 @@ class TestGetUnwrappedMountPrefixes:
 
 
 class TestBaseRunnerBehaviorUnchanged:
-    """The exemption hook must be absent on non-container runners."""
+    """Non-container runners must exempt nothing (empty prefixes)."""
 
-    def test_base_runner_lacks_method(self):
-        """A plain LsfCommandRunner does not expose the exemption hook."""
-        assert not hasattr(_make_base_runner(),
-                           'get_unwrapped_mount_prefixes')
+    def test_base_runner_returns_empty(self):
+        """A plain LsfCommandRunner inherits the base [] (no exemptions).
 
-    def test_backend_getattr_fallback_yields_empty(self):
-        """The backend's getattr fallback returns [] for a base runner.
-
-        Mirrors the exact call the backend makes in _execute_file_mounts, so a
-        non-LSF-container runner produces no exemptions and the wrap behavior is
-        unchanged.
+        The backend calls ``runners[0].get_unwrapped_mount_prefixes()`` directly;
+        for any runner that does not override it, the CommandRunner base returns
+        ``[]`` so the wrap behavior is unchanged.
         """
-        base = _make_base_runner()
-        prefixes = getattr(base, 'get_unwrapped_mount_prefixes',
-                           lambda: [])()
-        assert prefixes == []
+        assert _make_base_runner().get_unwrapped_mount_prefixes() == []
+
+    def test_base_class_defines_method(self):
+        """The guarantee is structural: CommandRunner defines the method."""
+        assert (command_runner.CommandRunner.get_unwrapped_mount_prefixes is
+                not LsfContainerCommandRunner.get_unwrapped_mount_prefixes)
+        # The base method exists and returns [] without an override.
+        assert command_runner.LsfCommandRunner.get_unwrapped_mount_prefixes is (
+            command_runner.CommandRunner.get_unwrapped_mount_prefixes)
