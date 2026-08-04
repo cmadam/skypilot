@@ -47,8 +47,16 @@ _SHARED_FS_ROOTS = ['/proj', '/opt/share']
 # job. Used to filter user-configured enroot_mounts when deriving shared roots
 # (e.g. device mounts like /dev/shm, plus node-local scratch), preventing them
 # from being wrongly exempted from the backend's symlink-wrap.
+#
+# NOTE: _is_shared_identity_mount treats this as a denylist -- an identity mount
+# whose path is outside every prefix here is assumed shared. That fails open for
+# an unrecognized node-local path (silent empty read in the job rather than a
+# loud error), so keep this list conservative. /home is included because the
+# container sets ENROOT_MOUNT_HOME=false (see _build_enroot_block) -- HOME is
+# deliberately not the shared, container-visible path, so a /home identity mount
+# must not be exempted.
 _NODE_LOCAL_MOUNT_PREFIXES = ('/tmp', '/opt/nvme', '/dev', '/run', '/proc',
-                              '/sys', '/var/tmp')
+                              '/sys', '/var/tmp', '/home')
 
 
 def _is_shared_identity_mount(mount_spec: str) -> bool:
@@ -1075,6 +1083,14 @@ def get_command_runners(
     if image_id and enroot_enabled:
         dispatch_dir = f'{sky_cluster_home_dir}/.sky/dispatch'
 
+    # Shared-FS roots whose file_mounts the backend must not symlink-wrap.
+    # Homogeneous per cluster, so derive once and log it: a misplaced payload
+    # (e.g. an enroot_mount wrongly classified as shared) otherwise leaves no
+    # trace to debug.
+    shared_fs_roots = _derive_shared_fs_roots(
+        provider_config.get('enroot_mounts', []))
+    logger.debug(f'LSF file_mount wrap-exemption roots: {shared_fs_roots}')
+
     runners = [
         command_runner.LsfCommandRunner(
             (instance_info.external_ip or login_node_ssh_hostname,
@@ -1089,8 +1105,7 @@ def get_command_runners(
             ssh_control_name=ssh_control_name,
             disable_identities_only=True,
             dispatch_dir=dispatch_dir,
-            shared_fs_roots=_derive_shared_fs_roots(
-                provider_config.get('enroot_mounts', [])),
+            shared_fs_roots=shared_fs_roots,
         ) for instance_info in instances
     ]
 

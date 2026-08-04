@@ -31,6 +31,8 @@ class TestIsSharedIdentityMount:
         '/opt/nvme/$USER /opt/nvme/$USER',  # under node-local prefix
         '/run/x /run/x',
         '/var/tmp/x /var/tmp/x',
+        '/home /home',  # container sets ENROOT_MOUNT_HOME=false
+        '/home/dave /home/dave',  # under /home
     ])
     def test_node_local_mounts_excluded(self, spec):
         assert lsf_instance._is_shared_identity_mount(spec) is False
@@ -84,6 +86,12 @@ class TestDeriveSharedFsRoots:
     def test_duplicate_builtin_deduped(self):
         assert lsf_instance._derive_shared_fs_roots(
             ['/proj /proj', '/opt/share /opt/share']) == ['/proj', '/opt/share']
+
+    def test_home_mount_not_exempted(self):
+        # HOME is not shared into the container (ENROOT_MOUNT_HOME=false), so a
+        # /home identity mount must fail closed rather than be exempted.
+        assert lsf_instance._derive_shared_fs_roots(
+            ['/home/dave /home/dave']) == ['/proj', '/opt/share']
 
     def test_returns_new_list_not_builtin(self):
         """Result must not alias the module-level _SHARED_FS_ROOTS."""
