@@ -29,21 +29,79 @@ logger = sky_logging.init_logger(__name__)
 
 _POLL_INTERVAL = 5
 
-# Shared network-filesystem roots that are bind-mounted *identity* into the
-# enroot container (see the mount lines emitted by _build_enroot_setup_block).
+# Built-in shared network-filesystem roots that are bind-mounted *identity*
+# into the enroot container (see the mount lines emitted by _build_enroot_block).
 # A file_mount destination under one of these is written directly on the
 # (sudo-less) login node and is visible to the containerized job at the same
-# path, so the backend must NOT symlink-wrap it. Passed to
-# LsfContainerCommandRunner as shared_fs_roots and surfaced to the backend via
-# get_unwrapped_mount_prefixes. /tmp and /opt/nvme are node-local (not shared
-# across the login/compute split) and are intentionally excluded.
+# path, so the backend must NOT symlink-wrap it. Surfaced to the backend via
+# LsfContainerCommandRunner.get_unwrapped_mount_prefixes(). /tmp and /opt/nvme
+# are node-local (not shared across the login/compute split) and are excluded.
 #
-# TODO(drift): this list is maintained by hand alongside the identity mount
-# lines emitted in _build_enroot_block (the `echo "/proj /proj"` etc. block). If
-# those bind-mounts change and this is not updated in lockstep, file_mounts
-# silently break with no signal. Follow-up: derive both from one structured
-# source (e.g. a list of (path, is_shared) tuples) so they cannot desync.
+# User-configured enroot_mounts are folded in at runtime by
+# _derive_shared_fs_roots(), so an extra shared mount (e.g. /gpfs /gpfs) is
+# handled without editing this list.
+#
+# TODO(drift): this built-in list is still maintained by hand alongside the
+# hardcoded identity mount lines in _build_enroot_block. If those change and
+# this is not updated in lockstep, file_mounts to a *built-in* root can silently
+# break. (User-added roots no longer have this problem.) Follow-up: derive both
+# from one structured source (e.g. (path, is_shared) tuples) so they can't desync.
 _SHARED_FS_ROOTS = ['/proj', '/opt/share']
+
+# Prefixes that are bind-mounted *identity* into the container but are
+# node-local (NOT shared across the login/compute split), so a login-node write
+# is not visible to the job. Used to filter user-configured enroot_mounts when
+# deriving shared roots — e.g. the /dev/shm and /dev/infiniband device mounts on
+# bluevela, plus node-local scratch. Excluding these prevents wrongly exempting
+# them from the backend's symlink-wrap.
+_NODE_LOCAL_MOUNT_PREFIXES = ('/tmp', '/opt/nvme', '/dev', '/run', '/proc',
+                              '/sys', '/var/tmp')
+
+
+def _is_shared_identity_mount(mount_spec: str) -> bool:
+    """Return whether an enroot mount spec is a shared, identity bind-mount.
+
+    A spec qualifies only if its host and container paths are identical (an
+    identity mount, so a login-node write is visible to the job at the same
+    path) AND the path is absolute and not under a known node-local prefix
+    (identity-mounted but not shared across the login/compute split).
+
+    :param mount_spec: an enroot mount string such as ``"/gpfs /gpfs"`` or
+        ``"/dev/shm /dev/shm"`` (optionally followed by mount flags).
+    :returns: True iff the spec is a shared, identity bind-mount usable for
+        file_mount wrap-exemption.
+    """
+    parts = mount_spec.split()
+    if len(parts) < 2 or parts[0] != parts[1]:
+        return False
+    path = parts[1]
+    if not path.startswith('/'):
+        return False
+    return not any(path == p or path.startswith(p + '/')
+                   for p in _NODE_LOCAL_MOUNT_PREFIXES)
+
+
+def _derive_shared_fs_roots(cluster: Optional[str]) -> List[str]:
+    """Derive the shared-FS wrap-exemption roots for an LSF cluster.
+
+    Unions the built-in :data:`_SHARED_FS_ROOTS` with any user-configured
+    ``enroot_mounts`` that are shared identity mounts (see
+    :func:`_is_shared_identity_mount`), so a user who bind-mounts an extra
+    shared filesystem (e.g. ``/gpfs``) also gets their file_mounts to that root
+    left un-wrapped. Node-local device/scratch mounts are excluded. Order is
+    preserved and duplicates removed.
+
+    :param cluster: the LSF cluster name, or None if unknown (built-ins only).
+    :returns: the ordered, de-duplicated list of shared-FS root prefixes.
+    """
+    roots = list(_SHARED_FS_ROOTS)
+    if cluster:
+        roots += [
+            spec.split()[1]
+            for spec in lsf_utils.get_enroot_mounts(cluster)
+            if _is_shared_identity_mount(spec)
+        ]
+    return list(dict.fromkeys(roots))  # de-dupe, preserving order
 
 
 def _get_client(provider_config: Dict[str, Any]) -> lsf_adaptor.LsfClient:
@@ -960,11 +1018,13 @@ def get_command_runners(
     For LSF, commands are routed through the login node via SSH.
     Uses LsfContainerCommandRunner (a LsfCommandRunner subclass) which handles
     the banned rsync wrapper by specifying --rsync-path to the real rsync
-    binary, and exposes the shared network-filesystem roots (``_SHARED_FS_ROOTS``,
-    bind-mounted identity into the enroot container) via
-    get_unwrapped_mount_prefixes() so the backend leaves file_mounts destined for
-    those roots un-wrapped — written directly on the login node and visible to
-    the containerized job at the same path (see that class).
+    binary, and exposes this cluster's shared network-filesystem roots (the
+    built-in ``_SHARED_FS_ROOTS`` plus any shared identity ``enroot_mounts``,
+    resolved by ``_derive_shared_fs_roots``; all bind-mounted identity into the
+    enroot container) via get_unwrapped_mount_prefixes() so the backend leaves
+    file_mounts destined for those roots un-wrapped — written directly on the
+    login node and visible to the containerized job at the same path (see that
+    class).
     """
     del credentials  # Use provider_config SSH info instead
 
@@ -1028,7 +1088,7 @@ def get_command_runners(
             ssh_control_name=ssh_control_name,
             disable_identities_only=True,
             dispatch_dir=dispatch_dir,
-            shared_fs_roots=_SHARED_FS_ROOTS,
+            shared_fs_roots=_derive_shared_fs_roots(lsf_cluster_name),
         ) for instance_info in instances
     ]
 
