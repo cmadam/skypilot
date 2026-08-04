@@ -7,8 +7,6 @@ qualify as shared roots (_is_shared_identity_mount) and how the built-in list is
 unioned with user-configured mounts (_derive_shared_fs_roots).
 """
 
-from unittest import mock
-
 import pytest
 
 from sky.provision.lsf import instance as lsf_instance
@@ -52,56 +50,44 @@ class TestIsSharedIdentityMount:
 
 
 class TestDeriveSharedFsRoots:
-    """Tests for _derive_shared_fs_roots."""
+    """Tests for _derive_shared_fs_roots.
 
-    def _patch_mounts(self, mounts):
-        """Patch lsf_utils.get_enroot_mounts to return the given specs."""
-        return mock.patch.object(lsf_instance.lsf_utils,
-                                 'get_enroot_mounts',
-                                 return_value=mounts)
+    The input is the enroot mount-spec list frozen into the container at
+    provision time (provider_config['enroot_mounts']) — the same source
+    _build_enroot_block uses — so the exemption can never claim a root the
+    container does not actually mount.
+    """
 
-    def test_none_cluster_returns_builtins_only(self):
-        assert lsf_instance._derive_shared_fs_roots(None) == ['/proj',
-                                                              '/opt/share']
-
-    def test_no_configured_mounts_returns_builtins(self):
-        with self._patch_mounts([]):
-            assert lsf_instance._derive_shared_fs_roots('bluevela') == [
-                '/proj', '/opt/share'
-            ]
+    def test_no_mounts_returns_builtins_only(self):
+        assert lsf_instance._derive_shared_fs_roots([]) == [
+            '/proj', '/opt/share'
+        ]
 
     def test_shared_mount_appended(self):
-        with self._patch_mounts(['/gpfs /gpfs']):
-            assert lsf_instance._derive_shared_fs_roots('bluevela') == [
-                '/proj', '/opt/share', '/gpfs'
-            ]
+        assert lsf_instance._derive_shared_fs_roots(['/gpfs /gpfs']) == [
+            '/proj', '/opt/share', '/gpfs'
+        ]
 
     def test_node_local_mounts_filtered_out(self):
-        with self._patch_mounts(
-            ['/dev/shm /dev/shm', '/dev/infiniband /dev/infiniband']):
-            assert lsf_instance._derive_shared_fs_roots('bluevela') == [
+        assert lsf_instance._derive_shared_fs_roots(
+            ['/dev/shm /dev/shm', '/dev/infiniband /dev/infiniband']) == [
                 '/proj', '/opt/share'
             ]
 
     def test_mixed_mounts(self):
-        with self._patch_mounts([
-                '/dev/shm /dev/shm', '/gpfs /gpfs', '/proj /proj', '/tmp /tmp'
-        ]):
-            # /gpfs added; /dev/shm and /tmp filtered; /proj de-duped.
-            assert lsf_instance._derive_shared_fs_roots('bluevela') == [
+        # /gpfs added; /dev/shm and /tmp filtered; /proj de-duped.
+        assert lsf_instance._derive_shared_fs_roots(
+            ['/dev/shm /dev/shm', '/gpfs /gpfs', '/proj /proj', '/tmp /tmp']) == [
                 '/proj', '/opt/share', '/gpfs'
             ]
 
     def test_duplicate_builtin_deduped(self):
-        with self._patch_mounts(['/proj /proj', '/opt/share /opt/share']):
-            assert lsf_instance._derive_shared_fs_roots('bluevela') == [
-                '/proj', '/opt/share'
-            ]
+        assert lsf_instance._derive_shared_fs_roots(
+            ['/proj /proj', '/opt/share /opt/share']) == ['/proj', '/opt/share']
 
     def test_returns_new_list_not_builtin(self):
         """Result must not alias the module-level _SHARED_FS_ROOTS."""
-        with self._patch_mounts([]):
-            result = lsf_instance._derive_shared_fs_roots('bluevela')
+        result = lsf_instance._derive_shared_fs_roots([])
         assert result is not lsf_instance._SHARED_FS_ROOTS
         result.append('/mutated')
         assert '/mutated' not in lsf_instance._SHARED_FS_ROOTS

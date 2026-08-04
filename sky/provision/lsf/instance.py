@@ -32,9 +32,9 @@ _POLL_INTERVAL = 5
 # enroot container (see the mount lines in _build_enroot_block). Passed to the
 # runner as shared_fs_roots and surfaced to the backend via
 # LsfCommandRunner.get_unwrapped_mount_prefixes() (which documents why these are
-# exempt from symlink-wrapping). User-configured enroot_mounts are folded in at
-# runtime by _derive_shared_fs_roots(), so an extra shared mount needs no edit
-# here.
+# exempt from symlink-wrapping). User-configured enroot_mounts are folded in by
+# _derive_shared_fs_roots() from the same provisioned provider_config the
+# container is built from, so an extra shared mount needs no edit here.
 #
 # TODO(dawood): this built-in list is maintained by hand alongside the identity
 # mount lines in _build_enroot_block; if those change without updating this,
@@ -77,29 +77,36 @@ def _is_shared_identity_mount(mount_spec: str) -> bool:
                    for p in _NODE_LOCAL_MOUNT_PREFIXES)
 
 
-def _derive_shared_fs_roots(cluster: Optional[str]) -> List[str]:
-    """Derive the shared-FS wrap-exemption roots for an LSF cluster.
+def _derive_shared_fs_roots(enroot_mounts: List[str]) -> List[str]:
+    """Derive the shared-FS wrap-exemption roots from the container's mounts.
 
-    Unions the built-in ``_SHARED_FS_ROOTS`` with any user-configured
-    ``enroot_mounts`` that are shared identity mounts (see
-    ``_is_shared_identity_mount``), so a user who bind-mounts an extra
-    shared filesystem (e.g. ``/gpfs``) also gets their file_mounts to that root
-    left un-wrapped. Node-local device/scratch mounts are excluded. Order is
-    preserved and duplicates removed.
+    Unions the built-in ``_SHARED_FS_ROOTS`` with any of ``enroot_mounts`` that
+    are shared identity mounts (see ``_is_shared_identity_mount``), so a user who
+    bind-mounts an extra shared filesystem (e.g. ``/gpfs``) also gets their
+    file_mounts to that root left un-wrapped. Node-local device/scratch mounts
+    are excluded. Order is preserved and duplicates removed.
+
+    ``enroot_mounts`` must be the list the container is actually built from
+    (``provider_config['enroot_mounts']``, frozen into the bsub script at
+    provision time and consumed by ``_build_enroot_block``). Deriving the
+    exemption from that same source keeps it from ever claiming a root the
+    container does not mount -- an unmounted root would silently redirect a
+    file_mount to an empty path -- and, unlike live sky config, it cannot drift
+    after launch.
 
     Args:
-        cluster: the LSF cluster name, or None if unknown (built-ins only).
+        enroot_mounts: the enroot bind-mount specs frozen into the container at
+            provision time (empty when none are configured).
 
     Returns:
         The ordered, de-duplicated list of shared-FS root prefixes.
     """
     roots = list(_SHARED_FS_ROOTS)
-    if cluster:
-        roots += [
-            spec.split()[1]
-            for spec in lsf_utils.get_enroot_mounts(cluster)
-            if _is_shared_identity_mount(spec)
-        ]
+    roots += [
+        spec.split()[1]
+        for spec in enroot_mounts
+        if _is_shared_identity_mount(spec)
+    ]
     return list(dict.fromkeys(roots))  # de-dupe, preserving order
 
 
@@ -1082,7 +1089,8 @@ def get_command_runners(
             ssh_control_name=ssh_control_name,
             disable_identities_only=True,
             dispatch_dir=dispatch_dir,
-            shared_fs_roots=_derive_shared_fs_roots(lsf_cluster_name),
+            shared_fs_roots=_derive_shared_fs_roots(
+                provider_config.get('enroot_mounts', [])),
         ) for instance_info in instances
     ]
 

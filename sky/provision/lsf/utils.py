@@ -441,24 +441,6 @@ def get_enroot_config(cluster: str) -> Dict[str, Any]:
     }
 
 
-def get_enroot_mounts(cluster: str) -> List[str]:
-    """Get the user-configured enroot bind-mount specs for an LSF cluster.
-
-    Reads ``lsf.cluster_configs.<cluster>.enroot_mounts`` from sky config. Each
-    entry is an enroot mount spec string, typically
-    ``"<host_path> <container_path>"`` (optionally followed by mount flags),
-    matching the identity bind-mount lines emitted by ``_build_enroot_block``.
-
-    Args:
-        cluster: the LSF cluster name.
-
-    Returns:
-        The list of mount spec strings (empty when unset).
-    """
-    return skypilot_config.get_nested(
-        ('lsf', 'cluster_configs', cluster, 'enroot_mounts'), [])
-
-
 def get_bsub_options(cluster: str,
                      queue: Optional[str] = None) -> Dict[str, str]:
     """Get bsub options from sky config with three-level merge.
