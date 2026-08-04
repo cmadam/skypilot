@@ -1,14 +1,9 @@
 """Tests for LsfCommandRunner's shared-FS wrap-exemption plumbing.
 
-An LSF runner does exactly one extra thing for file_mounts: it records the
-shared network-filesystem roots (bind-mounted identity into the enroot
-container) passed at construction and exposes them via
-``get_unwrapped_mount_prefixes()``. The backend's ``_execute_file_mounts`` reads
-that list to decide which file_mount destinations skip the sudo-symlink-wrap.
-These tests lock in that contract and, crucially, the "behavior elsewhere is
-unchanged" guarantee: the CommandRunner base class defines
-get_unwrapped_mount_prefixes() returning ``[]``, so any runner (including an LSF
-runner constructed with no shared roots) exempts nothing unless roots are given.
+Locks in the get_unwrapped_mount_prefixes() contract (see that method for the
+rationale): roots passed at construction are surfaced for the backend's
+file_mount wrap-exemption, and a runner with no roots — like the CommandRunner
+base — exempts nothing.
 """
 
 from sky.utils import command_runner
@@ -20,9 +15,12 @@ def _make_runner(shared_fs_roots=None):
     Passing ``ssh_private_key=None`` skips key-file creation in the SSH base
     class, so construction is side-effect free and safe in a unit test.
 
-    :param shared_fs_roots: value forwarded to the ``shared_fs_roots`` kwarg
-        (``None`` exercises the default).
-    :returns: a constructed LsfCommandRunner.
+    Args:
+        shared_fs_roots: value forwarded to the ``shared_fs_roots`` kwarg
+            (``None`` exercises the default).
+
+    Returns:
+        A constructed LsfCommandRunner.
     """
     return command_runner.LsfCommandRunner(('login-host', 22),
                                            'me',

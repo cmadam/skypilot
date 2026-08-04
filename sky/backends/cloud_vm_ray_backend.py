@@ -6242,21 +6242,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         style = colorama.Style
         start = time.time()
         runners = handle.get_command_runners()
-        # gbserver/LSF: destinations under a shared, container-visible bind-mount
-        # root (e.g. /proj on bluevela) are written directly on the login node
-        # (writable, sudo-free) and are visible to the containerized job at the
-        # identical path via the enroot identity bind-mount. Such destinations
-        # must NOT be sudo-symlink-wrapped — wrapping redirects them to
-        # ~/.sky/file_mounts/... and breaks that identity mapping. The LSF runner
-        # exposes these roots via get_unwrapped_mount_prefixes(); every other
-        # runner returns [] (the CommandRunner base default) so behavior
-        # elsewhere is unchanged.
+        # Destinations under a runner-declared shared-FS root must be left
+        # un-wrapped (see CommandRunner.get_unwrapped_mount_prefixes). Consult
+        # runners[0] only: the set is homogeneous per cluster, so prefixes from
+        # other runners would be ignored — fine for LSF (the only override)
+        # today; the base returns [] so behavior elsewhere is unchanged.
         unwrapped_prefixes: List[str] = []
         if runners:
-            # Assumes a homogeneous runner set (true for LSF today): only
-            # runners[0] is consulted, so if a heterogeneous set ever reaches
-            # this cloud-agnostic path, prefixes from other runners are ignored.
-            # Not worth iterating over all runners today.
             unwrapped_prefixes = runners[0].get_unwrapped_mount_prefixes()
         log_path = os.path.join(self.log_dir, 'file_mounts.log')
         num_threads = subprocess_utils.get_max_workers_for_file_mounts(

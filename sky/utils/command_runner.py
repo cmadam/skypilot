@@ -341,16 +341,14 @@ class CommandRunner:
     def get_unwrapped_mount_prefixes(self) -> List[str]:
         """Return file_mount destination prefixes exempt from symlink-wrapping.
 
-        The backend's ``_execute_file_mounts`` normally sudo-symlink-wraps every
-        absolute, non-``~/``/non-``/tmp/`` destination. A runner may override
-        this to declare shared, container-visible filesystem roots (e.g. ``/proj``
-        on the LSF/enroot backend, which are bind-mounted *identity* into the
-        container) whose destinations must be left un-wrapped so they persist at
-        the identical path the job reads.
+        A runner may override this to declare filesystem roots whose file_mount
+        destinations ``_execute_file_mounts`` must leave un-wrapped (see
+        ``LsfCommandRunner.get_unwrapped_mount_prefixes`` for the motivating
+        case).
 
-        :returns: absolute path prefixes to exempt. The base implementation
-            returns ``[]``, so every runner is un-exempt (behavior unchanged)
-            unless it explicitly overrides this.
+        Returns:
+            Absolute path prefixes to exempt. The base implementation returns
+            ``[]``, so a runner exempts nothing unless it overrides this.
         """
         return []
 
@@ -1942,13 +1940,10 @@ class LocalProcessCommandRunner(CommandRunner):
 class LsfCommandRunner(SSHCommandRunner):
     """Runner for LSF commands.
 
-    Routes commands and file transfers through the LSF login node.
-    Handles the case where rsync is banned on login nodes by specifying
-    the full path to the real rsync binary via --rsync-path.
-
-    When ``shared_fs_roots`` is supplied, those absolute prefixes are exposed
-    via :meth:`get_unwrapped_mount_prefixes` so the backend leaves file_mounts
-    destined for them un-wrapped (see that method).
+    Routes commands and file transfers through the LSF login node. Handles the
+    case where rsync is banned on login nodes by specifying the full path to the
+    real rsync binary via --rsync-path. Shared-FS roots passed as
+    ``shared_fs_roots`` are surfaced via get_unwrapped_mount_prefixes().
     """
 
     _ENV_SETUP = 'export UV_CACHE_DIR=/tmp/uv_cache_$(id -u)'
@@ -1968,10 +1963,11 @@ class LsfCommandRunner(SSHCommandRunner):
     ):
         """Initialize the LSF login-node command runner.
 
-        :param shared_fs_roots: absolute path prefixes that are bind-mounted
-            identity into the enroot container (e.g. ``['/proj']``); file_mount
-            destinations under these are exempt from the backend's symlink-wrap.
-            Defaults to no exemptions (empty), matching a plain LSF runner.
+        Args:
+            shared_fs_roots: absolute path prefixes bind-mounted identity into
+                the enroot container (e.g. ``['/proj']``); file_mount
+                destinations under these are exempt from the backend's
+                symlink-wrap. Defaults to no exemptions.
         """
         super().__init__(node, ssh_user, ssh_private_key, **kwargs)
         self.sky_dir = sky_dir
@@ -1983,20 +1979,19 @@ class LsfCommandRunner(SSHCommandRunner):
     def get_unwrapped_mount_prefixes(self) -> List[str]:
         """Return the shared-FS roots whose file_mounts must not be wrapped.
 
-        Overrides :meth:`CommandRunner.get_unwrapped_mount_prefixes` (which
-        returns ``[]``) to declare this cluster's identity-mounted shared-FS
-        roots. The LSF login node and the compute node running the job share
-        only these network-filesystem roots (bind-mounted *identity* into the
-        enroot container), so a payload written there on the login node is
-        visible to the job at the identical path. This holds whether or not the
-        step is containerized — an LSF runner with no shared roots simply
-        returns ``[]``.
+        The LSF login node (where file_mounts execute) and the compute node
+        running the job share only these network-filesystem roots, which are
+        bind-mounted *identity* into the enroot container, so a payload written
+        to such a root on the login node is visible to the job at the identical
+        path. The backend's ``_execute_file_mounts`` normally sudo-symlink-wraps
+        every absolute, non-``~/``/non-``/tmp/`` destination, which both fails on
+        the sudo-less login node and redirects the payload to
+        ``~/.sky/file_mounts/...`` — breaking that identity mapping. Roots
+        returned here are left un-wrapped instead. This holds whether or not the
+        step is containerized; a runner with no shared roots returns ``[]``.
 
-        Consumed by ``_execute_file_mounts`` in the backend: a destination equal
-        to, or under, one of these prefixes bypasses ``make_safe_symlink_command``
-        and is rsynced straight to the shared filesystem on the login node.
-
-        :returns: a copy of the identity-mounted shared-FS root prefixes.
+        Returns:
+            A copy of the identity-mounted shared-FS root prefixes.
         """
         return list(self._shared_fs_roots)
 

@@ -449,8 +449,11 @@ def get_enroot_mounts(cluster: str) -> List[str]:
     ``"<host_path> <container_path>"`` (optionally followed by mount flags),
     matching the identity bind-mount lines emitted by ``_build_enroot_block``.
 
-    :param cluster: the LSF cluster name.
-    :returns: the list of mount spec strings (empty when unset).
+    Args:
+        cluster: the LSF cluster name.
+
+    Returns:
+        The list of mount spec strings (empty when unset).
     """
     return skypilot_config.get_nested(
         ('lsf', 'cluster_configs', cluster, 'enroot_mounts'), [])
