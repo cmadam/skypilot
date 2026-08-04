@@ -954,8 +954,11 @@ def get_command_runners(
     For LSF, commands are routed through the login node via SSH.
     Uses LsfContainerCommandRunner (a LsfCommandRunner subclass) which handles
     the banned rsync wrapper by specifying --rsync-path to the real rsync
-    binary, and additionally routes container-HOME (``~``) file_mounts so they
-    are staged and copied into the enroot container (see that class).
+    binary, and exposes the shared network-filesystem roots (``_SHARED_FS_ROOTS``,
+    bind-mounted identity into the enroot container) via
+    get_unwrapped_mount_prefixes() so the backend leaves file_mounts destined for
+    those roots un-wrapped — written directly on the login node and visible to
+    the containerized job at the same path (see that class).
     """
     del credentials  # Use provider_config SSH info instead
 
