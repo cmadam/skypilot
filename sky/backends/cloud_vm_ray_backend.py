@@ -6252,6 +6252,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # runner returns [] so behavior elsewhere is unchanged.
         unwrapped_prefixes: List[str] = []
         if runners:
+            # Assumes a homogeneous runner set (true for LSF today): only
+            # runners[0] is consulted, so if a heterogeneous set ever reaches
+            # this cloud-agnostic path, prefixes from other runners are ignored.
+            # Not worth iterating over all runners today.
             unwrapped_prefixes = getattr(runners[0],
                                          'get_unwrapped_mount_prefixes',
                                          lambda: [])()
