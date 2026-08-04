@@ -18,7 +18,6 @@ from sky.utils import status_lib
 from sky.adaptors import lsf as lsf_adaptor
 from sky.provision import common
 from sky.provision import constants as provision_constants
-from sky.provision.lsf import command_runner as lsf_command_runner
 from sky.provision.lsf import utils as lsf_utils
 from sky.skylet import constants
 from sky.utils import command_runner
@@ -34,8 +33,8 @@ _POLL_INTERVAL = 5
 # A file_mount destination under one of these is written directly on the
 # (sudo-less) login node and is visible to the containerized job at the same
 # path, so the backend must NOT symlink-wrap it. Surfaced to the backend via
-# LsfContainerCommandRunner.get_unwrapped_mount_prefixes(). /tmp and /opt/nvme
-# are node-local (not shared across the login/compute split) and are excluded.
+# LsfCommandRunner.get_unwrapped_mount_prefixes(). /tmp and /opt/nvme are
+# node-local (not shared across the login/compute split) and are excluded.
 #
 # User-configured enroot_mounts are folded in at runtime by
 # _derive_shared_fs_roots(), so an extra shared mount (e.g. /gpfs /gpfs) is
@@ -1015,16 +1014,15 @@ def get_command_runners(
 ) -> List[command_runner.LsfCommandRunner]:
     """Get command runners for each instance in the cluster.
 
-    For LSF, commands are routed through the login node via SSH.
-    Uses LsfContainerCommandRunner (a LsfCommandRunner subclass) which handles
-    the banned rsync wrapper by specifying --rsync-path to the real rsync
-    binary, and exposes this cluster's shared network-filesystem roots (the
-    built-in ``_SHARED_FS_ROOTS`` plus any shared identity ``enroot_mounts``,
-    resolved by ``_derive_shared_fs_roots``; all bind-mounted identity into the
-    enroot container) via get_unwrapped_mount_prefixes() so the backend leaves
-    file_mounts destined for those roots un-wrapped — written directly on the
-    login node and visible to the containerized job at the same path (see that
-    class).
+    For LSF, commands are routed through the login node via SSH. Uses
+    LsfCommandRunner, which handles the banned rsync wrapper by specifying
+    --rsync-path to the real rsync binary, and exposes this cluster's shared
+    network-filesystem roots (the built-in ``_SHARED_FS_ROOTS`` plus any shared
+    identity ``enroot_mounts``, resolved by ``_derive_shared_fs_roots``; all
+    bind-mounted identity into the enroot container) via
+    get_unwrapped_mount_prefixes() so the backend leaves file_mounts destined
+    for those roots un-wrapped — written directly on the login node and visible
+    to the containerized job at the same path.
     """
     del credentials  # Use provider_config SSH info instead
 
@@ -1075,7 +1073,7 @@ def get_command_runners(
         dispatch_dir = f'{sky_cluster_home_dir}/.sky/dispatch'
 
     runners = [
-        lsf_command_runner.LsfContainerCommandRunner(
+        command_runner.LsfCommandRunner(
             (instance_info.external_ip or login_node_ssh_hostname,
              instance_info.ssh_port),
             login_node_ssh_user,
