@@ -338,6 +338,20 @@ class CommandRunner:
     def node_id(self) -> str:
         return '-'.join(str(x) for x in self.node)
 
+    def get_unwrapped_mount_prefixes(self) -> List[str]:
+        """Return file_mount destination prefixes exempt from symlink-wrapping.
+
+        A runner may override this to declare filesystem roots whose file_mount
+        destinations ``_execute_file_mounts`` must leave un-wrapped (see
+        ``LsfCommandRunner.get_unwrapped_mount_prefixes`` for the motivating
+        case).
+
+        Returns:
+            Absolute path prefixes to exempt. The base implementation returns
+            ``[]``, so a runner exempts nothing unless it overrides this.
+        """
+        return []
+
     def get_remote_home_dir(self) -> str:
         # Use pattern matching to extract home directory.
         # Some container images print MOTD when login shells start, which can
@@ -1926,9 +1940,10 @@ class LocalProcessCommandRunner(CommandRunner):
 class LsfCommandRunner(SSHCommandRunner):
     """Runner for LSF commands.
 
-    Routes commands and file transfers through the LSF login node.
-    Handles the case where rsync is banned on login nodes by specifying
-    the full path to the real rsync binary via --rsync-path.
+    Routes commands and file transfers through the LSF login node. Handles the
+    case where rsync is banned on login nodes by specifying the full path to the
+    real rsync binary via --rsync-path. Shared-FS roots passed as
+    ``shared_fs_roots`` are surfaced via get_unwrapped_mount_prefixes().
     """
 
     _ENV_SETUP = 'export UV_CACHE_DIR=/tmp/uv_cache_$(id -u)'
@@ -1943,13 +1958,54 @@ class LsfCommandRunner(SSHCommandRunner):
         skypilot_runtime_dir: str,
         remote_rsync_path: str = '/usr/bin/rsync',
         dispatch_dir: Optional[str] = None,
+        shared_fs_roots: Optional[List[str]] = None,
         **kwargs,
     ):
+        """Initialize the LSF login-node command runner.
+
+        Args:
+            shared_fs_roots: absolute path prefixes bind-mounted identity into
+                the enroot container (e.g. ``['/proj']``); file_mount
+                destinations under these are exempt from the backend's
+                symlink-wrap. Defaults to no exemptions.
+        """
         super().__init__(node, ssh_user, ssh_private_key, **kwargs)
         self.sky_dir = sky_dir
         self.skypilot_runtime_dir = skypilot_runtime_dir
         self.remote_rsync_path = remote_rsync_path
         self.dispatch_dir = dispatch_dir
+        self._shared_fs_roots: List[str] = list(shared_fs_roots or [])
+
+    def get_unwrapped_mount_prefixes(self) -> List[str]:
+        """Return the shared-FS roots whose file_mounts must not be wrapped.
+
+        The LSF login node (where file_mounts execute) and the compute node
+        running the job share only these network-filesystem roots, which are
+        bind-mounted *identity* into the enroot container, so a payload written
+        to such a root on the login node is visible to the job at the identical
+        path. The backend's ``_execute_file_mounts`` normally sudo-symlink-wraps
+        every absolute, non-``~/``/non-``/tmp/`` destination, which both fails on
+        the sudo-less login node and redirects the payload to
+        ``~/.sky/file_mounts/...`` — breaking that identity mapping. Roots
+        returned here are left un-wrapped instead. This holds whether or not the
+        step is containerized; a runner with no shared roots returns ``[]``.
+
+        Deliberate trade-off: un-wrapping also opts these roots out of
+        ``make_safe_symlink_command``'s clobber guard, which errors out when the
+        destination already exists as a real file or dir. Un-wrapped roots join
+        ``~/`` and ``/tmp/`` in the "delegated to rsync" category, so a
+        file_mount onto an existing shared path (e.g. ``/proj/data``) rsyncs into
+        it rather than refusing. This is intended: it lets a re-launch land the
+        same payload idempotently instead of erroring on the existing dir, and is
+        consistent with the documented ``~/``/``/tmp/`` behavior. The cost is that
+        an accidental overwrite is not caught here — acceptable because these are
+        deliberately configured shared roots, but worth noting on a team-visible
+        filesystem.
+
+        Returns:
+            A copy of the identity-mounted shared-FS root prefixes.
+        """
+        return list(self._shared_fs_roots)
 
     def rsync(
         self,

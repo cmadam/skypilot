@@ -28,6 +28,102 @@ logger = sky_logging.init_logger(__name__)
 
 _POLL_INTERVAL = 5
 
+# Built-in shared network-filesystem roots bind-mounted *identity* into the
+# enroot container (see the mount lines in _build_enroot_block). Passed to the
+# runner as shared_fs_roots and surfaced to the backend via
+# LsfCommandRunner.get_unwrapped_mount_prefixes() (which documents why these are
+# exempt from symlink-wrapping).
+#
+# This built-in list is the ONLY source of shared roots today.
+# _derive_shared_fs_roots() is written to also fold in user-configured
+# enroot_mounts, but those are not yet propagated into provider_config (neither
+# sky/clouds/lsf.py nor lsf-ray.yml.j2 passes them), so that branch never
+# contributes. A user who bind-mounts an extra shared filesystem (e.g. /gpfs)
+# must add it here until propagation is wired up. The omission is fail-closed:
+# an unlisted root is symlink-wrapped (a loud sudo failure), never silently
+# redirected. This propagation gap predates the file_mounts work.
+#
+# TODO(dawood): this built-in list is maintained by hand alongside the identity
+# mount lines in _build_enroot_block; if those change without updating this,
+# file_mounts to a *built-in* root can silently break. Follow-up: derive both
+# from one structured source (e.g. (path, is_shared) tuples).
+_SHARED_FS_ROOTS = ['/proj', '/opt/share']
+
+# Prefixes bind-mounted *identity* into the container but node-local (NOT shared
+# across the login/compute split), so a login-node write is not visible to the
+# job. Used to filter user-configured enroot_mounts when deriving shared roots
+# (e.g. device mounts like /dev/shm, plus node-local scratch), preventing them
+# from being wrongly exempted from the backend's symlink-wrap.
+#
+# NOTE: _is_shared_identity_mount treats this as a denylist -- an identity mount
+# whose path is outside every prefix here is assumed shared. That fails open for
+# an unrecognized node-local path (silent empty read in the job rather than a
+# loud error), so keep this list conservative. /home is included because the
+# container sets ENROOT_MOUNT_HOME=false (see _build_enroot_block) -- HOME is
+# deliberately not the shared, container-visible path, so a /home identity mount
+# must not be exempted.
+_NODE_LOCAL_MOUNT_PREFIXES = ('/tmp', '/opt/nvme', '/dev', '/run', '/proc',
+                              '/sys', '/var/tmp', '/home')
+
+
+def _is_shared_identity_mount(mount_spec: str) -> bool:
+    """Return whether an enroot mount spec is a shared, identity bind-mount.
+
+    A spec qualifies only if its host and container paths are identical (an
+    identity mount, so a login-node write is visible to the job at the same
+    path) AND the path is absolute and not under a known node-local prefix
+    (identity-mounted but not shared across the login/compute split).
+
+    Args:
+        mount_spec: an enroot mount string such as ``"/gpfs /gpfs"`` or
+            ``"/dev/shm /dev/shm"`` (optionally followed by mount flags).
+
+    Returns:
+        True iff the spec is a shared, identity bind-mount usable for
+        file_mount wrap-exemption.
+    """
+    parts = mount_spec.split()
+    if len(parts) < 2 or parts[0] != parts[1]:
+        return False
+    path = parts[1]
+    if not path.startswith('/'):
+        return False
+    return not any(path == p or path.startswith(p + '/')
+                   for p in _NODE_LOCAL_MOUNT_PREFIXES)
+
+
+def _derive_shared_fs_roots(enroot_mounts: List[str]) -> List[str]:
+    """Derive the shared-FS wrap-exemption roots from the container's mounts.
+
+    Unions the built-in ``_SHARED_FS_ROOTS`` with any of ``enroot_mounts`` that
+    are shared identity mounts (see ``_is_shared_identity_mount``), so a user who
+    bind-mounts an extra shared filesystem (e.g. ``/gpfs``) also gets their
+    file_mounts to that root left un-wrapped. Node-local device/scratch mounts
+    are excluded. Order is preserved and duplicates removed.
+
+    ``enroot_mounts`` must be the list the container is actually built from
+    (``provider_config['enroot_mounts']``, frozen into the bsub script at
+    provision time and consumed by ``_build_enroot_block``). Deriving the
+    exemption from that same source keeps it from ever claiming a root the
+    container does not mount -- an unmounted root would silently redirect a
+    file_mount to an empty path -- and, unlike live sky config, it cannot drift
+    after launch.
+
+    Args:
+        enroot_mounts: the enroot bind-mount specs frozen into the container at
+            provision time (empty when none are configured).
+
+    Returns:
+        The ordered, de-duplicated list of shared-FS root prefixes.
+    """
+    roots = list(_SHARED_FS_ROOTS)
+    roots += [
+        spec.split()[1]
+        for spec in enroot_mounts
+        if _is_shared_identity_mount(spec)
+    ]
+    return list(dict.fromkeys(roots))  # de-dupe, preserving order
+
 
 def _get_client(provider_config: Dict[str, Any]) -> lsf_adaptor.LsfClient:
     """Create an LsfClient from provider config."""
@@ -940,9 +1036,11 @@ def get_command_runners(
 ) -> List[command_runner.LsfCommandRunner]:
     """Get command runners for each instance in the cluster.
 
-    For LSF, commands are routed through the login node via SSH.
-    Uses LsfCommandRunner which handles the banned rsync wrapper
-    by specifying --rsync-path to the real rsync binary.
+    For LSF, commands are routed through the login node via SSH. Uses
+    LsfCommandRunner, which handles the banned rsync wrapper via --rsync-path
+    and is given this cluster's shared-FS roots (built-in _SHARED_FS_ROOTS plus
+    shared identity enroot_mounts, resolved by _derive_shared_fs_roots) for
+    file_mount wrap-exemption.
     """
     del credentials  # Use provider_config SSH info instead
 
@@ -992,6 +1090,14 @@ def get_command_runners(
     if image_id and enroot_enabled:
         dispatch_dir = f'{sky_cluster_home_dir}/.sky/dispatch'
 
+    # Shared-FS roots whose file_mounts the backend must not symlink-wrap.
+    # Homogeneous per cluster, so derive once and log it: a misplaced payload
+    # (e.g. an enroot_mount wrongly classified as shared) otherwise leaves no
+    # trace to debug.
+    shared_fs_roots = _derive_shared_fs_roots(
+        provider_config.get('enroot_mounts', []))
+    logger.debug(f'LSF file_mount wrap-exemption roots: {shared_fs_roots}')
+
     runners = [
         command_runner.LsfCommandRunner(
             (instance_info.external_ip or login_node_ssh_hostname,
@@ -1006,6 +1112,7 @@ def get_command_runners(
             ssh_control_name=ssh_control_name,
             disable_identities_only=True,
             dispatch_dir=dispatch_dir,
+            shared_fs_roots=shared_fs_roots,
         ) for instance_info in instances
     ]
 
