@@ -1990,6 +1990,18 @@ class LsfCommandRunner(SSHCommandRunner):
         returned here are left un-wrapped instead. This holds whether or not the
         step is containerized; a runner with no shared roots returns ``[]``.
 
+        Deliberate trade-off: un-wrapping also opts these roots out of
+        ``make_safe_symlink_command``'s clobber guard, which errors out when the
+        destination already exists as a real file or dir. Un-wrapped roots join
+        ``~/`` and ``/tmp/`` in the "delegated to rsync" category, so a
+        file_mount onto an existing shared path (e.g. ``/proj/data``) rsyncs into
+        it rather than refusing. This is intended: it lets a re-launch land the
+        same payload idempotently instead of erroring on the existing dir, and is
+        consistent with the documented ``~/``/``/tmp/`` behavior. The cost is that
+        an accidental overwrite is not caught here — acceptable because these are
+        deliberately configured shared roots, but worth noting on a team-visible
+        filesystem.
+
         Returns:
             A copy of the identity-mounted shared-FS root prefixes.
         """
