@@ -1,5 +1,5 @@
-        #!/bin/bash
-        #BSUB -J sky-gold-kd-abc123
+#!/bin/bash
+#BSUB -J sky-gold-kd-abc123
 #BSUB -o /proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/sky_logs/%J.out
 #BSUB -e /proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/sky_logs/%J.err
 #BSUB -n 1
@@ -8,45 +8,45 @@
 #BSUB -G grp_granite_dot_build
 #BSUB -M 64G
 
-        # === SkyPilot LSF provisioner ===
-        set -e
+# === SkyPilot LSF provisioner ===
+set -e
 
-        cleanup() {
-            local exit_code=$?
-            set +e
-            echo "[$(date)] Cleaning up SkyPilot LSF instance..."
-            # Signal this node's dispatcher to shut down gracefully
-            [ -n "${DISPATCH_DIR:-}" ] && [ -d "${DISPATCH_DIR}" ] &&                 touch "${DISPATCH_DIR}/.shutdown"
-            # Kill background processes (enroot dispatcher, etc.)
-            kill $(jobs -p) 2>/dev/null || true
-            # Kill catatonit orphans (scoped to this job's process tree)
-            pkill -9 -P $$ -x catatonit 2>/dev/null || true
-            # Remove enroot container if it exists
-            if command -v enroot &>/dev/null && [[ -n "${CONTAINER_NAME:-}" ]]; then
-                enroot remove -f "$CONTAINER_NAME" 2>/dev/null || true
-            fi
-            # Remove temp wrapper directory
-            [[ -n "${BV_WRAPPER_DIR:-}" && -d "${BV_WRAPPER_DIR:-}" ]] && rm -rf "$BV_WRAPPER_DIR"
-            echo "[$(date)] Cleanup done (exit code: $exit_code)"
-            exit $exit_code
-        }
-        trap cleanup EXIT
-        trap 'exit 0' TERM
+cleanup() {
+    local exit_code=$?
+    set +e
+    echo "[$(date)] Cleaning up SkyPilot LSF instance..."
+    # Signal this node's dispatcher to shut down gracefully
+    [ -n "${DISPATCH_DIR:-}" ] && [ -d "${DISPATCH_DIR}" ] &&         touch "${DISPATCH_DIR}/.shutdown"
+    # Kill background processes (enroot dispatcher, etc.)
+    kill $(jobs -p) 2>/dev/null || true
+    # Kill catatonit orphans (scoped to this job's process tree)
+    pkill -9 -P $$ -x catatonit 2>/dev/null || true
+    # Remove enroot container if it exists
+    if command -v enroot &>/dev/null && [[ -n "${CONTAINER_NAME:-}" ]]; then
+        enroot remove -f "$CONTAINER_NAME" 2>/dev/null || true
+    fi
+    # Remove temp wrapper directory
+    [[ -n "${BV_WRAPPER_DIR:-}" && -d "${BV_WRAPPER_DIR:-}" ]] && rm -rf "$BV_WRAPPER_DIR"
+    echo "[$(date)] Cleanup done (exit code: $exit_code)"
+    exit $exit_code
+}
+trap cleanup EXIT
+trap 'exit 0' TERM
 
-        # Create directories
-        mkdir -p "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/sky_logs" "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky"
-        mkdir -p "/opt/nvme/$USER/skypilot-tmp"
+# Create directories
+mkdir -p "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/sky_logs" "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky"
+mkdir -p "/opt/nvme/$USER/skypilot-tmp"
 
-        # Remove this node's stale ready signal from previous runs. Scoped to
-        # this host: a worker must not delete a peer's fresh signal.
-        rm -f "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_ready.$(hostname -s)"
+# Remove this node's stale ready signal from previous runs. Scoped to
+# this host: a worker must not delete a peer's fresh signal.
+rm -f "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_ready.$(hostname -s)"
 
-        # Write marker file
-        touch "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_lsf_cluster"
+# Write marker file
+touch "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_lsf_cluster"
 
-        [ -f "/proj/granite-build/g4os/bv-nccl-tuning.sh" ] && source "/proj/granite-build/g4os/bv-nccl-tuning.sh"
+[ -f "/proj/granite-build/g4os/bv-nccl-tuning.sh" ] && source "/proj/granite-build/g4os/bv-nccl-tuning.sh"
 
-        # === Compute topology ===
+# === Compute topology ===
 NUM_GPUS_PER_NODE=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
 TOTAL_NODES=$(echo "${LSB_HOSTS:-$(hostname)}" | tr ' ' '\n' | sort -u | wc -l)
 LOCAL_HOST=$(hostname -s)
@@ -72,7 +72,7 @@ if [[ "$RANK" == "0" ]]; then
 fi
 
 
-        # === Enroot container setup ===
+# === Enroot container setup ===
 
 # ── BlueVela workarounds ──────────────────────────────────────────────
 BV_WRAPPER_DIR=$(mktemp -d -t bv-enroot-wrappers.XXXXXX)
@@ -286,19 +286,19 @@ done
 echo "[$(date)] Enroot container ready (PID=$ENROOT_PID), dispatch_dir=$DISPATCH_DIR"
 
 
-        # Signal ready: this node always, plus the legacy shared path from
-        # rank 0 so an older driver still sees a cluster come up.
-        touch "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_ready.$(hostname -s)"
-        if [[ "${RANK:-0}" == "0" ]]; then
-            touch "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_ready"
-        fi
-        echo "SkyPilot LSF instance ready: sky-gold-kd-abc123 (node $(hostname -s), rank ${RANK:-0})"
+# Signal ready: this node always, plus the legacy shared path from
+# rank 0 so an older driver still sees a cluster come up.
+touch "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_ready.$(hostname -s)"
+if [[ "${RANK:-0}" == "0" ]]; then
+    touch "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_ready"
+fi
+echo "SkyPilot LSF instance ready: sky-gold-kd-abc123 (node $(hostname -s), rank ${RANK:-0})"
 
-        # Keep job alive until terminated
-        if [[ -n "${ENROOT_PID:-}" ]]; then
-            # Container mode: wait for dispatcher to exit (or be killed)
-            wait $ENROOT_PID
-        else
-            # Bare-metal mode: sleep forever
-            sleep infinity
-        fi
+# Keep job alive until terminated
+if [[ -n "${ENROOT_PID:-}" ]]; then
+    # Container mode: wait for dispatcher to exit (or be killed)
+    wait $ENROOT_PID
+else
+    # Bare-metal mode: sleep forever
+    sleep infinity
+fi

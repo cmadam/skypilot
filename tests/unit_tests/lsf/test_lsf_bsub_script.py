@@ -16,6 +16,7 @@ Then read ``git diff testdata/`` as part of the change.
 import difflib
 import os
 from pathlib import Path
+import subprocess
 from typing import Any, Dict
 
 import pytest
@@ -368,3 +369,89 @@ class TestWaitForAllReadySignals:
             self.READY,
             'cluster', ['host1.bluevela.example.com', 'host2.example.com'],
             timeout=5)
+
+
+class TestScriptIsColumnZero:
+    """Three things in this script are only meaningful at column 0.
+
+    The template is interpolated from separately-built blocks that each start at
+    column 0, which makes textwrap.dedent a silent no-op over the whole
+    template — so this was previously emitting an indented `#!` line and an
+    indented first `#BSUB` directive. Nothing failed: `submit_job` passes
+    `bsub -J <name> -q <queue> < script`, so the ignored in-script `-J`/`-q` were
+    already supplied on the command line, and every other directive happened to
+    be on an interpolated (column-0) line. The `#!` line was simply unused, with
+    LSF falling back to the submitting user's login shell for a script full of
+    bashisms.
+    """
+
+    ALL_CASES = [
+        ('single_node_bare', _base_provider_config, 1),
+        ('single_node_enroot', _enroot_provider_config, 1),
+        ('two_node_enroot', _enroot_provider_config, 2),
+        ('four_node_enroot', _enroot_provider_config, 4),
+    ]
+
+    @pytest.mark.parametrize('name,config_fn,num_nodes', ALL_CASES)
+    def test_shebang_is_the_first_line(self, name, config_fn, num_nodes):
+        del name  # only for test ids
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 config_fn(),
+                                                 num_nodes=num_nodes)
+        assert script.startswith('#!/bin/bash\n'), (
+            'an indented #! is a comment, not a shebang, leaving the '
+            "interpreter to the submitting user's login shell")
+
+    @pytest.mark.parametrize('name,config_fn,num_nodes', ALL_CASES)
+    def test_every_bsub_directive_is_unindented(self, name, config_fn,
+                                                num_nodes):
+        del name
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 config_fn(),
+                                                 num_nodes=num_nodes)
+        indented = [
+            line for line in script.split('\n') if
+            line.lstrip().startswith('#BSUB') and not line.startswith('#BSUB')
+        ]
+        assert not indented, f'LSF ignores indented directives: {indented}'
+
+    @pytest.mark.parametrize('name,config_fn,num_nodes', ALL_CASES)
+    def test_script_is_valid_bash(self, name, config_fn, num_nodes):
+        """`bash -n` the whole script.
+
+        Cheap insurance for a file assembled from four independently-built
+        heredoc-bearing blocks, where a terminator drifting off column 0 would
+        swallow the rest of the script as heredoc body.
+        """
+        del name
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 config_fn(),
+                                                 num_nodes=num_nodes)
+        result = subprocess.run(['bash', '-n'],
+                                input=script,
+                                capture_output=True,
+                                text=True,
+                                check=False)
+        assert result.returncode == 0, f'bash -n failed: {result.stderr}'
+
+    def test_heredoc_terminators_are_unindented(self):
+        """The block builders emit `<< 'EOF'`, not `<<-`, so no leading tabs."""
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        for terminator in ('DISPATCH_EOF', 'ENROOT_CFG_STATIC',
+                           'ENROOT_CFG_DYNAMIC', 'WRAPPER'):
+            assert f'\n{terminator}\n' in script, (
+                f'{terminator} is not at column 0')
+
+    def test_in_script_job_name_matches_the_command_line_one(self):
+        """`#BSUB -J` becomes effective now that it is unindented.
+
+        submit_job also passes `-J <cluster_name_on_cloud>`; the command line
+        wins, and both carry the same value, so nothing changes behaviorally.
+        This pins that agreement rather than leaving it to coincidence.
+        """
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        assert f'#BSUB -J {CLUSTER_NAME}\n' in script

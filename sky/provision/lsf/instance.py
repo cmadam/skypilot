@@ -670,70 +670,80 @@ def _build_bsub_script(
     ready_signal = f'{sky_cluster_home}/.sky_ready'
     ready_signal_host = f'{ready_signal}.$(hostname -s)'
 
-    script = textwrap.dedent(f"""\
-        #!/bin/bash
-        {directives_str}
+    # NOTE: this template is written flush-left on purpose, and does NOT go
+    # through textwrap.dedent. dedent computes the longest common leading
+    # whitespace over all lines, and the interpolated blocks below
+    # (directives_str, topology_block, container_block) contribute
+    # column-0 lines, which drives that common prefix to "" and makes
+    # dedent a silent no-op. Three things here require column 0:
+    #   - the `#!` line, which is only a shebang at the start of a line;
+    #   - `#BSUB` directives, which LSF ignores unless unindented;
+    #   - heredoc terminators (the block builders emit `<< 'EOF'`, not `<<-`).
+    # _build_enroot_block builds its block flush-left for the same reason.
+    script = f"""\
+#!/bin/bash
+{directives_str}
 
-        # === SkyPilot LSF provisioner ===
-        set -e
+# === SkyPilot LSF provisioner ===
+set -e
 
-        cleanup() {{
-            local exit_code=$?
-            set +e
-            echo "[$(date)] Cleaning up SkyPilot LSF instance..."
-            # Signal this node's dispatcher to shut down gracefully
-            [ -n "${{DISPATCH_DIR:-}}" ] && [ -d "${{DISPATCH_DIR}}" ] && \
-                touch "${{DISPATCH_DIR}}/.shutdown"
-            # Kill background processes (enroot dispatcher, etc.)
-            kill $(jobs -p) 2>/dev/null || true
-            # Kill catatonit orphans (scoped to this job's process tree)
-            pkill -9 -P $$ -x catatonit 2>/dev/null || true
-            # Remove enroot container if it exists
-            if command -v enroot &>/dev/null && [[ -n "${{CONTAINER_NAME:-}}" ]]; then
-                enroot remove -f "$CONTAINER_NAME" 2>/dev/null || true
-            fi
-            # Remove temp wrapper directory
-            [[ -n "${{BV_WRAPPER_DIR:-}}" && -d "${{BV_WRAPPER_DIR:-}}" ]] && rm -rf "$BV_WRAPPER_DIR"
-            echo "[$(date)] Cleanup done (exit code: $exit_code)"
-            exit $exit_code
-        }}
-        trap cleanup EXIT
-        trap 'exit 0' TERM
+cleanup() {{
+    local exit_code=$?
+    set +e
+    echo "[$(date)] Cleaning up SkyPilot LSF instance..."
+    # Signal this node's dispatcher to shut down gracefully
+    [ -n "${{DISPATCH_DIR:-}}" ] && [ -d "${{DISPATCH_DIR}}" ] && \
+        touch "${{DISPATCH_DIR}}/.shutdown"
+    # Kill background processes (enroot dispatcher, etc.)
+    kill $(jobs -p) 2>/dev/null || true
+    # Kill catatonit orphans (scoped to this job's process tree)
+    pkill -9 -P $$ -x catatonit 2>/dev/null || true
+    # Remove enroot container if it exists
+    if command -v enroot &>/dev/null && [[ -n "${{CONTAINER_NAME:-}}" ]]; then
+        enroot remove -f "$CONTAINER_NAME" 2>/dev/null || true
+    fi
+    # Remove temp wrapper directory
+    [[ -n "${{BV_WRAPPER_DIR:-}}" && -d "${{BV_WRAPPER_DIR:-}}" ]] && rm -rf "$BV_WRAPPER_DIR"
+    echo "[$(date)] Cleanup done (exit code: $exit_code)"
+    exit $exit_code
+}}
+trap cleanup EXIT
+trap 'exit 0' TERM
 
-        # Create directories
-        mkdir -p "{sky_cluster_home}/sky_logs" "{sky_cluster_home}/.sky"
-        mkdir -p "{tmpdir}"
+# Create directories
+mkdir -p "{sky_cluster_home}/sky_logs" "{sky_cluster_home}/.sky"
+mkdir -p "{tmpdir}"
 
-        # Remove this node's stale ready signal from previous runs. Scoped to
-        # this host: a worker must not delete a peer's fresh signal.
-        rm -f "{ready_signal_host}"
+# Remove this node's stale ready signal from previous runs. Scoped to
+# this host: a worker must not delete a peer's fresh signal.
+rm -f "{ready_signal_host}"
 
-        # Write marker file
-        touch "{marker_file}"
+# Write marker file
+touch "{marker_file}"
 
-        {nccl_block}
+{nccl_block}
 
-        {topology_block}
+{topology_block}
 
-        {container_block}
+{container_block}
 
-        # Signal ready: this node always, plus the legacy shared path from
-        # rank 0 so an older driver still sees a cluster come up.
-        touch "{ready_signal_host}"
-        if [[ "${{RANK:-0}}" == "0" ]]; then
-            touch "{ready_signal}"
-        fi
-        echo "SkyPilot LSF instance ready: {cluster_name_on_cloud} (node $(hostname -s), rank ${{RANK:-0}})"
+# Signal ready: this node always, plus the legacy shared path from
+# rank 0 so an older driver still sees a cluster come up.
+touch "{ready_signal_host}"
+if [[ "${{RANK:-0}}" == "0" ]]; then
+    touch "{ready_signal}"
+fi
+echo "SkyPilot LSF instance ready: {cluster_name_on_cloud} (node $(hostname -s), rank ${{RANK:-0}})"
 
-        # Keep job alive until terminated
-        if [[ -n "${{ENROOT_PID:-}}" ]]; then
-            # Container mode: wait for dispatcher to exit (or be killed)
-            wait $ENROOT_PID
-        else
-            # Bare-metal mode: sleep forever
-            sleep infinity
-        fi
-    """)
+# Keep job alive until terminated
+if [[ -n "${{ENROOT_PID:-}}" ]]; then
+    # Container mode: wait for dispatcher to exit (or be killed)
+    wait $ENROOT_PID
+else
+    # Bare-metal mode: sleep forever
+    sleep infinity
+fi
+"""
 
     return script
 
