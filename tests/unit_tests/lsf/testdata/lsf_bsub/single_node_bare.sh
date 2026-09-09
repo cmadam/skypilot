@@ -2,7 +2,8 @@
 #BSUB -J sky-gold-kd-abc123
 #BSUB -o /proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/sky_logs/%J.out
 #BSUB -e /proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/sky_logs/%J.err
-#BSUB -n 1
+#BSUB -n 4
+#BSUB -R "span[ptile=4]"
 #BSUB -M 64G
 
 # === SkyPilot LSF provisioner ===

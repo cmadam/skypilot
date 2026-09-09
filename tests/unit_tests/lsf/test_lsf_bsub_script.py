@@ -115,13 +115,22 @@ class TestBsubScriptSnapshots:
                                                  num_nodes=2)
         assert_bsub_matches_snapshot('two_node_enroot', script)
 
-    def test_four_node_enroot_cpus(self):
-        """4 nodes with cpus > 1.
+    def test_two_node_enroot_one_cpu(self):
+        """One slot per host: the directives must match the pre-fix form.
 
-        Records that `cpus` is currently dropped: `-n` carries the node count
-        alone, so a request for 8 CPUs per node is not represented in any
-        directive. Fixing that must change this snapshot and no single-node one.
+        This is the shape every existing cluster ran, so it is the regression
+        guard for the cpus fix — `-n` equals the node count, ptile is 1, and the
+        GPU request keeps its bare per-task form.
         """
+        config = _enroot_provider_config()
+        config['cpus'] = '1'
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 config,
+                                                 num_nodes=2)
+        assert_bsub_matches_snapshot('two_node_enroot_one_cpu', script)
+
+    def test_four_node_enroot_cpus(self):
+        """4 nodes with cpus > 1: 32 slots, 8 per host."""
         config = _enroot_provider_config()
         config['cpus'] = '8'
         script = lsf_instance._build_bsub_script(CLUSTER_NAME,
@@ -139,22 +148,35 @@ class TestBsubScriptInvariants:
     multi-node run misbehaves.
     """
 
-    def test_multinode_pins_one_task_per_host(self):
-        """`-n N` means slots, not hosts.
+    def test_multinode_span_makes_the_node_count_real(self):
+        """`-n` means slots, not hosts.
 
-        Without `span[ptile=1]` LSF may satisfy `-n 4` with four slots on one
-        host, silently collapsing a 4-node job onto a single machine.
+        Without a `span[ptile]` term LSF may satisfy the slot count from any mix
+        of hosts, silently collapsing a 4-node job onto fewer machines. The
+        fixture requests 4 CPUs per node, so 4 nodes is 16 slots at 4 per host.
         """
         script = lsf_instance._build_bsub_script(CLUSTER_NAME,
                                                  _enroot_provider_config(),
                                                  num_nodes=4)
-        assert '#BSUB -n 4' in script
-        assert '#BSUB -R "span[ptile=1]"' in script
+        assert '#BSUB -n 16' in script
+        assert '#BSUB -R "span[ptile=4]"' in script
         assert '#BSUB -hl' in script
 
-    def test_single_node_requests_no_span(self):
+    def test_single_node_multi_cpu_is_still_pinned_to_one_host(self):
+        """The span term matters at one node too: `-n 4` without it could be
+        satisfied by four separate hosts."""
         script = lsf_instance._build_bsub_script(CLUSTER_NAME,
                                                  _enroot_provider_config(),
+                                                 num_nodes=1)
+        assert '#BSUB -n 4' in script
+        assert '#BSUB -R "span[ptile=4]"' in script
+        assert '#BSUB -hl' not in script
+
+    def test_single_slot_job_needs_no_span(self):
+        config = _enroot_provider_config()
+        config['cpus'] = '1'
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 config,
                                                  num_nodes=1)
         assert '#BSUB -n 1' in script
         assert 'span[ptile' not in script
@@ -455,3 +477,90 @@ class TestScriptIsColumnZero:
                                                  _enroot_provider_config(),
                                                  num_nodes=2)
         assert f'#BSUB -J {CLUSTER_NAME}\n' in script
+
+
+class TestSlotsAndDistribution:
+    """-n counts slots; the node count is only real because of span[ptile]."""
+
+    def _script(self, cpus, num_nodes, acc_count='8'):
+        config = _enroot_provider_config()
+        config['cpus'] = cpus
+        config['accelerator_count'] = acc_count
+        return lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                               config,
+                                               num_nodes=num_nodes)
+
+    def test_slots_are_nodes_times_cpus(self):
+        """cpus was read and then never used in any directive, so every node got
+        one slot regardless of what was requested."""
+        assert '#BSUB -n 16' in self._script('8', 2)
+        assert '#BSUB -R "span[ptile=8]"' in self._script('8', 2)
+
+    def test_one_cpu_per_node_keeps_the_previous_directives(self):
+        script = self._script('1', 4)
+        assert '#BSUB -n 4' in script
+        assert '#BSUB -R "span[ptile=1]"' in script
+
+    def test_single_node_multi_cpu_still_pins_to_one_host(self):
+        """Without ptile, `-n 8` on a 1-node request could spread over 8 hosts,
+        which would quietly break the single-node assumption."""
+        script = self._script('8', 1)
+        assert '#BSUB -n 8' in script
+        assert '#BSUB -R "span[ptile=8]"' in script
+
+    def test_single_node_single_cpu_needs_no_span(self):
+        script = self._script('1', 1)
+        assert '#BSUB -n 1' in script
+        assert 'span[ptile' not in script
+
+    def test_host_level_limits_only_for_multi_node(self):
+        assert '#BSUB -hl' in self._script('8', 2)
+        assert '#BSUB -hl' not in self._script('8', 1)
+
+    @pytest.mark.parametrize('cpus', ['4.0', '4', 4])
+    def test_cpus_accepts_the_forms_skypilot_passes(self, cpus):
+        assert '#BSUB -n 8' in self._script(cpus, 2)
+
+    @pytest.mark.parametrize('cpus', ['', None, 'many', '0', '-2'])
+    def test_unparseable_or_nonpositive_cpus_falls_back_to_one_slot(self, cpus):
+        """Fail soft: a job that schedules with one slot per node beats a
+        provisioning crash, and the fallback is logged."""
+        script = self._script(cpus, 2)
+        assert '#BSUB -n 2' in script
+        assert '#BSUB -R "span[ptile=1]"' in script
+
+
+class TestGpuRequestIsPerHost:
+    """The GPU count must not scale with slots-per-host.
+
+    `-gpu num=` is per *task* by default and a task is a slot, so once ptile > 1
+    a per-task count multiplies: num=8 with 8 slots/host asks for 64 GPUs on
+    every host, and the job simply never schedules — it sits pending, which reads
+    as a busy cluster rather than a bad request.
+    """
+
+    def _gpu_line(self, cpus, num_nodes):
+        config = _enroot_provider_config()
+        config['cpus'] = cpus
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 config,
+                                                 num_nodes=num_nodes)
+        return next(l for l in script.split('\n') if l.startswith('#BSUB -gpu'))
+
+    def test_per_host_when_several_slots_per_host(self):
+        assert self._gpu_line(
+            '8', 2) == '#BSUB -gpu "num=8/host:mode=exclusive_process"'
+
+    def test_bare_form_kept_at_one_slot_per_host(self):
+        """Equivalent to /host there, and kept byte-identical so existing
+        clusters see no change to a directive that is already working."""
+        assert self._gpu_line('1',
+                              2) == '#BSUB -gpu "num=8:mode=exclusive_process"'
+
+    def test_no_gpu_directive_when_none_requested(self):
+        config = _base_provider_config()
+        config['cpus'] = '8'
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 config,
+                                                 num_nodes=2)
+        assert '#BSUB -gpu' not in script

@@ -597,16 +597,40 @@ def _build_bsub_script(
     if queue:
         bsub_directives.append(f'#BSUB -q {queue}')
 
-    if num_nodes > 1:
-        bsub_directives.append(f'#BSUB -n {num_nodes}')
-        bsub_directives.append('#BSUB -R "span[ptile=1]"')
-        bsub_directives.append('#BSUB -hl')
-    else:
-        bsub_directives.append('#BSUB -n 1')
+    # Slots and their distribution. LSF's -n counts *slots*, not hosts, so a
+    # request for N nodes with C CPUs each is N*C slots pinned to C per host by
+    # span[ptile=C]. The ptile term is what makes the node count real: without
+    # it LSF is free to satisfy -n from any mix of hosts, so `-n 4` could land
+    # as four slots on one machine.
+    #
+    # cpus was previously read and then never used in any directive: -n carried
+    # the node count alone, so every node got exactly one slot no matter what
+    # was requested.
+    try:
+        cpus_per_node = max(1, int(float(cpus)))
+    except (TypeError, ValueError):
+        logger.warning(f'Could not parse cpus={cpus!r} for '
+                       f'{cluster_name_on_cloud}; requesting 1 slot per node.')
+        cpus_per_node = 1
 
-    # GPU allocation
+    bsub_directives.append(f'#BSUB -n {num_nodes * cpus_per_node}')
+    if cpus_per_node > 1 or num_nodes > 1:
+        bsub_directives.append(f'#BSUB -R "span[ptile={cpus_per_node}]"')
+    if num_nodes > 1:
+        # Host-level limits: resource limits apply per host rather than to the
+        # job as a whole.
+        bsub_directives.append('#BSUB -hl')
+
+    # GPU allocation. `num=` is per *task* by default, and a task is a slot, so
+    # once there is more than one slot per host a per-task count multiplies:
+    # num=8 with 4 slots/host would ask for 32 GPUs on every host and the job
+    # would never schedule. Say /host explicitly in that case to keep the
+    # request per node. At one slot per host the two are equivalent, and the
+    # bare form is kept so existing clusters see a byte-identical directive.
     if int(acc_count) > 0:
-        gpu_directive = f'#BSUB -gpu "num={acc_count}:mode=exclusive_process"'
+        per = '/host' if cpus_per_node > 1 else ''
+        gpu_directive = (f'#BSUB -gpu "num={acc_count}{per}'
+                         f':mode=exclusive_process"')
         bsub_directives.append(gpu_directive)
 
     # Memory
