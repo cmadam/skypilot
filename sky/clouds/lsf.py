@@ -392,7 +392,8 @@ class LSF(clouds.Cloud):
             'enroot_share_path': enroot_config['share_path'],
             'enroot_use_local_nvme': str(enroot_config['use_local_nvme']),
             'enroot_squash_options': enroot_config['squash_options'],
-            'nccl_tuning_file': enroot_config.get('nccl_tuning_file', ''),
+            'nccl_tuning_file': lsf_utils.get_nccl_tuning_file(cluster),
+            'enroot_mounts': lsf_utils.get_enroot_mounts(cluster),
             'workdir': lsf_utils.get_workdir(cluster) or '',
             'tmpdir': lsf_utils.get_tmpdir(cluster) or '',
         }

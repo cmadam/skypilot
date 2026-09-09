@@ -49,6 +49,14 @@ provider:
 {% if nccl_tuning_file %}
   nccl_tuning_file: "{{nccl_tuning_file}}"
 {% endif %}
+{% if enroot_mounts %}
+  # Extra bind mounts, added to the built-in identity mounts. Those that are
+  # shared identity mounts also become file_mount wrap-exemption roots.
+  enroot_mounts:
+{% for mount in enroot_mounts %}
+    - "{{mount}}"
+{% endfor %}
+{% endif %}
 
   # Working directories
 {% if workdir %}

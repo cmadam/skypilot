@@ -34,14 +34,13 @@ _POLL_INTERVAL = 5
 # LsfCommandRunner.get_unwrapped_mount_prefixes() (which documents why these are
 # exempt from symlink-wrapping).
 #
-# This built-in list is the ONLY source of shared roots today.
-# _derive_shared_fs_roots() is written to also fold in user-configured
-# enroot_mounts, but those are not yet propagated into provider_config (neither
-# sky/clouds/lsf.py nor lsf-ray.yml.j2 passes them), so that branch never
-# contributes. A user who bind-mounts an extra shared filesystem (e.g. /gpfs)
-# must add it here until propagation is wired up. The omission is fail-closed:
-# an unlisted root is symlink-wrapped (a loud sudo failure), never silently
-# redirected. This propagation gap predates the file_mounts work.
+# User-configured enroot_mounts are folded in on top of this built-in list by
+# _derive_shared_fs_roots(); sky/clouds/lsf.py and lsf-ray.yml.j2 propagate them
+# into provider_config. The built-in entries remain because they are mounted
+# unconditionally by _build_enroot_block regardless of configuration.
+#
+# The classification is fail-closed: a root that is not recognized as shared is
+# symlink-wrapped (a loud sudo failure), never silently redirected.
 #
 # TODO(dawood): this built-in list is maintained by hand alongside the identity
 # mount lines in _build_enroot_block; if those change without updating this,
