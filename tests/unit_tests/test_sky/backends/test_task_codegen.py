@@ -1,9 +1,10 @@
-"""Snapshot tests for RayCodeGen and SlurmCodeGen code generation.
+"""Snapshot tests for RayCodeGen, SlurmCodeGen and LsfCodeGen code generation.
 
-These tests validate that RayCodeGen and SlurmCodeGen produce consistent output
-for various configurations. The expected outputs are stored in:
+These tests validate that the code generators produce consistent output for
+various configurations. The expected outputs are stored in:
 - testdata/ray_codegen/*.py
 - testdata/slurm_codegen/*.py
+- testdata/lsf_codegen/*.py
 
 To update snapshots when intentional changes are made:
     UPDATE_SNAPSHOT=1 pytest tests/unit_tests/test_sky/backends/test_task_codegen.py
@@ -19,6 +20,7 @@ from sky.provision.slurm import utils as slurm_utils
 
 TESTDATA_DIR = Path(__file__).parent / 'testdata' / 'ray_codegen'
 SLURM_TESTDATA_DIR = Path(__file__).parent / 'testdata' / 'slurm_codegen'
+LSF_TESTDATA_DIR = Path(__file__).parent / 'testdata' / 'lsf_codegen'
 
 
 def assert_codegen_matches_snapshot(test_name: str,
@@ -335,3 +337,185 @@ class TestRcloneFlushScript:
                                 capture_output=True,
                                 check=False)
         assert result.returncode == expected_code
+
+
+# ─── LsfCodeGen ──────────────────────────────────────────────────────────────
+#
+# These snapshots are a baseline, not an endorsement: LsfCodeGen currently
+# hardcodes single-node values in every branch, so test_lsf_multi_node_2nodes
+# below records generated code that is *wrong* for a 2-node job. Freezing it
+# first means the fix shows up as a reviewable diff rather than a wall of new
+# code. See the M1 commit plan (A1) for the sequence.
+
+
+def _lsf_task_env_vars():
+    return {
+        'SKYPILOT_TASK_ID': 'sky-2024-11-17-00-00-00-000001-cluster-2',
+        'MODEL_NAME': 'granite-4.1-3b-base',
+    }
+
+
+def test_lsf_single_node_dispatch():
+    """Single-node LSF job dispatched into a container via the shared FS.
+
+    Mirrors test_slurm_single_node_with_gpu() but for LsfCodeGen, whose
+    compute-node hop is the shared-filesystem dispatcher rather than srun.
+    """
+    codegen = task_codegen.LsfCodeGen(
+        container_dispatch_dir='/proj/granite-build/g4os/skypilot/'
+        'sky-gold-kd-abc123/.sky/dispatch',)
+    codegen.add_prologue(job_id=2)
+
+    resources_dict = {'CPU': 4.0, 'GPU': 8.0}
+    task_env_vars = _lsf_task_env_vars()
+
+    codegen.add_setup(
+        1,
+        resources_dict=resources_dict,
+        stable_cluster_internal_ips=['10.0.0.1'],
+        env_vars=task_env_vars,
+        log_dir='/sky/logs',
+        setup_cmd='echo no-op setup',
+    )
+
+    codegen.add_task(
+        1,
+        bash_script='accelerate launch gold/gold.py',
+        task_name='gold_distill',
+        resources_dict=resources_dict,
+        log_dir='/sky/logs/tasks',
+        env_vars=task_env_vars,
+    )
+
+    codegen.add_epilogue()
+
+    result = codegen.build()
+    assert_codegen_matches_snapshot('lsf_single_node_dispatch',
+                                    result,
+                                    testdata_dir=LSF_TESTDATA_DIR)
+
+
+def test_lsf_multi_node_2nodes():
+    """Two-node LSF job — the GOLD-distillation shape.
+
+    Records today's broken output so the multi-node fix is a visible diff. The
+    snapshot is expected to contain SKYPILOT_NUM_NODES=1, SKYPILOT_NODE_RANK=0,
+    SKYPILOT_NODE_IPS='127.0.0.1', and a single cmd_<seq>.sh write — see the
+    assertions in test_lsf_multi_node_is_currently_single_node below, which state
+    the bug directly rather than leaving it implicit in the golden file.
+    """
+    codegen = task_codegen.LsfCodeGen(
+        container_dispatch_dir='/proj/granite-build/g4os/skypilot/'
+        'sky-gold-kd-abc123/.sky/dispatch',)
+    codegen.add_prologue(job_id=2)
+
+    resources_dict = {'CPU': 4.0, 'GPU': 8.0}
+    task_env_vars = _lsf_task_env_vars()
+
+    codegen.add_setup(
+        2,
+        resources_dict=resources_dict,
+        stable_cluster_internal_ips=['10.0.0.1', '10.0.0.2'],
+        env_vars=task_env_vars,
+        log_dir='/sky/logs',
+        setup_cmd='echo no-op setup',
+    )
+
+    codegen.add_task(
+        2,
+        bash_script='accelerate launch gold/gold.py',
+        task_name='gold_distill',
+        resources_dict=resources_dict,
+        log_dir='/sky/logs/tasks',
+        env_vars=task_env_vars,
+    )
+
+    codegen.add_epilogue()
+
+    result = codegen.build()
+    assert_codegen_matches_snapshot('lsf_multi_node_2nodes',
+                                    result,
+                                    testdata_dir=LSF_TESTDATA_DIR)
+
+
+def test_lsf_multi_node_bare_metal():
+    """Two-node LSF job with no container (no dispatch dir).
+
+    The non-dispatch branch runs the user's script via run_bash_command_with_log
+    on the login node. Frozen separately because making bare-metal multi-node
+    execute on the compute nodes is a deliberate behavior change (A6), and this
+    is the golden that must move when it lands.
+    """
+    codegen = task_codegen.LsfCodeGen()
+    codegen.add_prologue(job_id=2)
+
+    resources_dict = {'CPU': 4.0, 'GPU': 0.0}
+    task_env_vars = _lsf_task_env_vars()
+
+    codegen.add_setup(
+        2,
+        resources_dict=resources_dict,
+        stable_cluster_internal_ips=['10.0.0.1', '10.0.0.2'],
+        env_vars=task_env_vars,
+        log_dir='/sky/logs',
+        setup_cmd=None,
+    )
+
+    codegen.add_task(
+        2,
+        bash_script='hostname',
+        task_name='topology_probe',
+        resources_dict=resources_dict,
+        log_dir='/sky/logs/tasks',
+        env_vars=task_env_vars,
+    )
+
+    codegen.add_epilogue()
+
+    result = codegen.build()
+    assert_codegen_matches_snapshot('lsf_multi_node_bare_metal',
+                                    result,
+                                    testdata_dir=LSF_TESTDATA_DIR)
+
+
+def test_lsf_multi_node_is_currently_single_node():
+    """State the multi-node bug as an assertion, not just a golden file.
+
+    A reviewer reading a large snapshot diff will not reliably notice that
+    SKYPILOT_NUM_NODES went from '1' to '2'. These assertions fail loudly the
+    moment the fix lands, which is the signal to update them to the correct
+    expectations rather than to regenerate a snapshot without reading it.
+    """
+    codegen = task_codegen.LsfCodeGen(
+        container_dispatch_dir='/tmp/dispatch',)
+    codegen.add_prologue(job_id=2)
+    codegen.add_setup(
+        2,
+        resources_dict={'CPU': 4.0},
+        stable_cluster_internal_ips=['10.0.0.1', '10.0.0.2'],
+        env_vars={},
+        log_dir='/sky/logs',
+        setup_cmd='true',
+    )
+    codegen.add_task(
+        2,
+        bash_script='hostname',
+        task_name='probe',
+        resources_dict={'CPU': 4.0},
+        log_dir='/sky/logs/tasks',
+        env_vars={},
+    )
+    codegen.add_epilogue()
+    code = codegen.build()
+
+    # The task is told it is alone on one node, and is given loopback as the
+    # peer list, so any rank-aware workload silently degenerates to rank 0.
+    assert "sky_env_vars_dict['SKYPILOT_NODE_RANK'] = 0" in code
+    assert "sky_env_vars_dict['SKYPILOT_NODE_IPS'] = '127.0.0.1'" in code
+    assert "'SKYPILOT_NUM_NODES'] = 1" in code
+    assert '10.0.0.2' not in code, (
+        'the second node\'s IP never reaches the generated code')
+
+    # Setup collides across nodes: the sequence name is a constant, so N nodes
+    # would contend for one cmd_setup.sh / rc_setup pair.
+    assert "seq = 'setup'" in code
