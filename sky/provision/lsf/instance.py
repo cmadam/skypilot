@@ -166,10 +166,115 @@ def _build_blaunch_dispatch(share_path: str, is_multinode: bool) -> str:
             mkdir -p "$(dirname "$SHARED_SCRIPT")"
             cp "$(realpath "${{BASH_SOURCE[0]}}")" "$SHARED_SCRIPT"
             export BV_WORKER=1
-            blaunch bash "$SHARED_SCRIPT"
+            # -z targets the deduplicated host list, one task per host. Bare
+            # `blaunch` launches once per *slot* in $LSB_HOSTS, so a job that
+            # requests several slots per host would start several dispatchers
+            # on the same node, all racing over one dispatch directory.
+            blaunch -z "${{UNIQUE_HOSTS[*]}}" bash "$SHARED_SCRIPT"
             exit $?
         fi
     """)
+
+
+def _build_dispatcher_block(dispatch_root: str) -> str:
+    """Build the per-host command dispatcher block.
+
+    The dispatcher is the LSF substitute for ``srun``: the driver writes
+    ``cmd_<seq>.sh`` into a directory on the shared filesystem, the dispatcher
+    executes it and writes ``out_<seq>.log`` plus ``rc_<seq>``.
+
+    The directory is keyed by short hostname, so every node gets its own. A
+    single shared directory cannot work for multi-node: each blaunch task runs
+    this same block, so each would ``rm -rf`` a directory the others are already
+    using, and whichever dispatcher happened to notice a ``cmd_*.sh`` first would
+    execute it — making the node that runs a given command nondeterministic.
+
+    Keyed by hostname rather than by rank deliberately. Rank is derived
+    independently on the two sides of this boundary (the driver from
+    ``bjobs -o EXEC_HOST`` order, the job from ``$LSB_HOSTS`` order) and LSF
+    guarantees no correspondence between them, whereas a short hostname means
+    the same thing to both.
+    """
+    return textwrap.dedent(f"""\
+        # ── Step 4: Command dispatcher (per host) ──────────────────────────────
+        DISPATCH_DIR="{dispatch_root}/$(hostname -s)"
+        rm -rf "$DISPATCH_DIR"
+        mkdir -p "$DISPATCH_DIR"
+        cat > "$DISPATCH_DIR/dispatcher.sh" << 'DISPATCH_EOF'
+        #!/bin/bash
+        DDIR="$1"
+        touch "$DDIR/.ready"
+        while true; do
+            for cmd_file in "$DDIR"/cmd_*.sh; do
+                [ -f "$cmd_file" ] || continue
+                seq="${{cmd_file##*/cmd_}}"; seq="${{seq%.sh}}"
+                /bin/bash "$cmd_file" > "$DDIR/out_${{seq}}.log" 2>&1
+                echo $? > "$DDIR/rc_${{seq}}"
+                mv "$cmd_file" "$DDIR/done_${{seq}}.sh"
+            done
+            [ -f "$DDIR/.shutdown" ] && break
+            sleep 0.5
+        done
+        DISPATCH_EOF
+        chmod +x "$DISPATCH_DIR/dispatcher.sh"
+    """)
+
+
+def _build_topology_block(num_nodes: int, sky_cluster_home: str) -> str:
+    """Build the topology block: rank, world size, master address and port.
+
+    Emitted for every job, containerized or not. Bare-metal multi-node jobs need
+    the same values, and the rank manifest this writes is what lets the driver
+    map a host to the rank the job actually assigned itself.
+
+    The manifest is the authority on rank. The driver must not infer rank from
+    the order of ``bjobs -o EXEC_HOST``: that is a separate derivation from the
+    ``$LSB_HOSTS`` order used here, and a mismatched rank/master pairing does not
+    fail fast — it hangs NCCL initialization until the collective timeout.
+    """
+    rank_detection = ''
+    if num_nodes > 1:
+        rank_detection = textwrap.dedent("""\
+            # Deduplicate while preserving order (first host = rank 0 = master).
+            # Order matters and must not be sorted: rank 0 is defined as the
+            # first host LSF listed.
+            UNIQUE_HOSTS=($(echo "$LSB_HOSTS" | tr ' ' '\\n' | awk '!seen[$0]++'))
+            if [[ -n "$LSB_HOSTS" ]]; then
+                for i in "${!UNIQUE_HOSTS[@]}"; do
+                    if [[ "${UNIQUE_HOSTS[$i]}" == "$LOCAL_HOST" ]]; then
+                        RANK=$i
+                        break
+                    fi
+                done
+            fi
+        """)
+    return textwrap.dedent("""\
+        # === Compute topology ===
+        NUM_GPUS_PER_NODE=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
+        TOTAL_NODES=$(echo "${{LSB_HOSTS:-$(hostname)}}" | tr ' ' '\\n' | sort -u | wc -l)
+        LOCAL_HOST=$(hostname -s)
+        MASTER_HOST=$(echo "${{LSB_HOSTS:-$(hostname -s)}}" | awk '{{print $1}}')
+        MASTER_PORT=$((29500 + (${{LSB_JOBID:-0}} % 1000)))
+
+        RANK=0
+        WORLD_SIZE=$TOTAL_NODES
+        LOCAL_RANK=0
+        {rank_detection}
+        export MASTER_ADDR="$MASTER_HOST"
+        export MASTER_PORT RANK WORLD_SIZE LOCAL_RANK
+        export NUM_GPUS_PER_NODE TOTAL_NODES
+        echo "[$(date)] Topology: node=$LOCAL_HOST rank=$RANK/$WORLD_SIZE gpus=$NUM_GPUS_PER_NODE master=$MASTER_HOST:$MASTER_PORT"
+
+        # Publish this node's rank so the driver can map host -> rank without
+        # re-deriving it from a different source.
+        TOPOLOGY_DIR="{sky_cluster_home}/.sky/topology"
+        mkdir -p "$TOPOLOGY_DIR"
+        echo "$LOCAL_HOST" > "$TOPOLOGY_DIR/rank-$RANK"
+        if [[ "$RANK" == "0" ]]; then
+            echo "$MASTER_HOST:$MASTER_PORT" > "$TOPOLOGY_DIR/master"
+        fi
+    """).format(rank_detection=rank_detection,
+                sky_cluster_home=sky_cluster_home)
 
 
 def _convert_to_enroot_uri(image_id: str) -> str:
@@ -194,7 +299,7 @@ def _build_enroot_block(image_id: str, container_name: str,
                         enroot_config: Dict[str, Any],
                         env_vars: Dict[str, str],
                         mounts: List[str],
-                        dispatch_dir: str,
+                        dispatch_root: str,
                         is_multinode: bool = False,
                         inject_topology: bool = True) -> str:
     """Build the full enroot setup block with BlueVela workarounds.
@@ -267,6 +372,8 @@ def _build_enroot_block(image_id: str, container_name: str,
     mount_lines += '    echo "/opt/share /opt/share"\n'
     for m in mounts:
         mount_lines += f'    echo "{m}"\n'
+
+    dispatcher_block = _build_dispatcher_block(dispatch_root)
 
     block = f"""\
 # === Enroot container setup ===
@@ -426,28 +533,7 @@ mounts() {{
 {mount_lines}}}
 ENROOT_CFG_DYNAMIC
 
-# ── Step 4: Command dispatcher ─────────────────────────────────────────
-DISPATCH_DIR="{dispatch_dir}"
-rm -rf "$DISPATCH_DIR"
-mkdir -p "$DISPATCH_DIR"
-cat > "$DISPATCH_DIR/dispatcher.sh" << 'DISPATCH_EOF'
-#!/bin/bash
-DDIR="$1"
-touch "$DDIR/.ready"
-while true; do
-    for cmd_file in "$DDIR"/cmd_*.sh; do
-        [ -f "$cmd_file" ] || continue
-        seq="${{cmd_file##*/cmd_}}"; seq="${{seq%.sh}}"
-        /bin/bash "$cmd_file" > "$DDIR/out_${{seq}}.log" 2>&1
-        echo $? > "$DDIR/rc_${{seq}}"
-        mv "$cmd_file" "$DDIR/done_${{seq}}.sh"
-    done
-    [ -f "$DDIR/.shutdown" ] && break
-    sleep 0.5
-done
-DISPATCH_EOF
-chmod +x "$DISPATCH_DIR/dispatcher.sh"
-
+{dispatcher_block}
 echo "[$(date)] Starting container with command dispatcher"
 enroot start --conf "$ENROOT_CONFIG_FILE" --rw "$CONTAINER_NAME" \\
     bash "$DISPATCH_DIR/dispatcher.sh" "$DISPATCH_DIR" &
@@ -546,8 +632,9 @@ def _build_bsub_script(
     if nccl_tuning:
         nccl_block = f'[ -f "{nccl_tuning}" ] && source "{nccl_tuning}"'
 
-    # Container block
-    dispatch_dir = f'{sky_cluster_home}/.sky/dispatch'
+    # Container block. dispatch_root is a directory *of* per-host dispatch
+    # directories; the bsub script appends $(hostname -s) to it.
+    dispatch_root = f'{sky_cluster_home}/.sky/dispatch'
     container_block = ''
     if image_id and enroot_enabled:
         enroot_config = {
@@ -565,50 +652,23 @@ def _build_bsub_script(
             enroot_config=enroot_config,
             env_vars={},
             mounts=extra_mounts,
-            dispatch_dir=dispatch_dir,
+            dispatch_root=dispatch_root,
             is_multinode=(num_nodes > 1),
             inject_topology=True,
         )
 
-    # Topology setup — always compute for container jobs (training scripts
-    # like run_dense_enroot.sh need NUM_GPUS_PER_NODE, WORLD_SIZE, etc.)
-    topology_block = ''
-    if image_id and enroot_enabled:
-        rank_detection = ''
-        if num_nodes > 1:
-            rank_detection = textwrap.dedent("""\
-                # Deduplicate while preserving order (first host = rank 0 = master)
-                UNIQUE_HOSTS=($(echo "$LSB_HOSTS" | tr ' ' '\\n' | awk '!seen[$0]++'))
-                if [[ -n "$LSB_HOSTS" ]]; then
-                    for i in "${!UNIQUE_HOSTS[@]}"; do
-                        if [[ "${UNIQUE_HOSTS[$i]}" == "$LOCAL_HOST" ]]; then
-                            RANK=$i
-                            break
-                        fi
-                    done
-                fi
-            """)
-        topology_block = textwrap.dedent("""\
-            # === Compute topology ===
-            NUM_GPUS_PER_NODE=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
-            TOTAL_NODES=$(echo "${{LSB_HOSTS:-$(hostname)}}" | tr ' ' '\\n' | sort -u | wc -l)
-            LOCAL_HOST=$(hostname -s)
-            MASTER_HOST=$(echo "${{LSB_HOSTS:-$(hostname -s)}}" | awk '{{print $1}}')
-            MASTER_PORT=$((29500 + (${{LSB_JOBID:-0}} % 1000)))
+    # Topology is computed for every job, not just containerized ones: a
+    # bare-metal multi-node job needs the same rank/master values, and the rank
+    # manifest it publishes is what the driver reads to map host -> rank.
+    topology_block = _build_topology_block(num_nodes, sky_cluster_home)
 
-            RANK=0
-            WORLD_SIZE=$TOTAL_NODES
-            LOCAL_RANK=0
-            {rank_detection}
-            export MASTER_ADDR="$MASTER_HOST"
-            export MASTER_PORT RANK WORLD_SIZE LOCAL_RANK
-            export NUM_GPUS_PER_NODE TOTAL_NODES
-            echo "[$(date)] Topology: node=$LOCAL_HOST rank=$RANK/$WORLD_SIZE gpus=$NUM_GPUS_PER_NODE master=$MASTER_HOST:$MASTER_PORT"
-        """).format(rank_detection=rank_detection)
-
-    # Marker file and ready signal
+    # Marker file and ready signals. Each node signals separately, so the
+    # driver can wait for the whole allocation rather than for whichever node
+    # happened to finish first — with one shared file, a 4-node job reports
+    # ready as soon as one node's container is up.
     marker_file = f'{sky_cluster_home}/{lsf_utils.LSF_MARKER_FILE}'
     ready_signal = f'{sky_cluster_home}/.sky_ready'
+    ready_signal_host = f'{ready_signal}.$(hostname -s)'
 
     script = textwrap.dedent(f"""\
         #!/bin/bash
@@ -621,8 +681,9 @@ def _build_bsub_script(
             local exit_code=$?
             set +e
             echo "[$(date)] Cleaning up SkyPilot LSF instance..."
-            # Signal dispatcher to shut down gracefully
-            [ -d "{dispatch_dir}" ] && touch "{dispatch_dir}/.shutdown"
+            # Signal this node's dispatcher to shut down gracefully
+            [ -n "${{DISPATCH_DIR:-}}" ] && [ -d "${{DISPATCH_DIR}}" ] && \
+                touch "${{DISPATCH_DIR}}/.shutdown"
             # Kill background processes (enroot dispatcher, etc.)
             kill $(jobs -p) 2>/dev/null || true
             # Kill catatonit orphans (scoped to this job's process tree)
@@ -643,8 +704,9 @@ def _build_bsub_script(
         mkdir -p "{sky_cluster_home}/sky_logs" "{sky_cluster_home}/.sky"
         mkdir -p "{tmpdir}"
 
-        # Remove stale ready signal from previous runs
-        rm -f "{ready_signal}"
+        # Remove this node's stale ready signal from previous runs. Scoped to
+        # this host: a worker must not delete a peer's fresh signal.
+        rm -f "{ready_signal_host}"
 
         # Write marker file
         touch "{marker_file}"
@@ -655,9 +717,13 @@ def _build_bsub_script(
 
         {container_block}
 
-        # Signal ready
-        touch "{ready_signal}"
-        echo "SkyPilot LSF instance ready: {cluster_name_on_cloud}"
+        # Signal ready: this node always, plus the legacy shared path from
+        # rank 0 so an older driver still sees a cluster come up.
+        touch "{ready_signal_host}"
+        if [[ "${{RANK:-0}}" == "0" ]]; then
+            touch "{ready_signal}"
+        fi
+        echo "SkyPilot LSF instance ready: {cluster_name_on_cloud} (node $(hostname -s), rank ${{RANK:-0}})"
 
         # Keep job alive until terminated
         if [[ -n "${{ENROOT_PID:-}}" ]]; then
@@ -741,12 +807,16 @@ def run_instances(
     if rc != 0:
         raise RuntimeError(f'Failed to write provision script: {stderr}')
 
-    # Remove stale ready signal before submitting (prevents race with
-    # _wait_for_ready_signal finding a leftover file from a previous run)
+    # Remove stale ready signals and the rank manifest before submitting, so
+    # the waiter cannot be satisfied by leftovers from a previous run of the
+    # same cluster name. Covers both the shared file and the per-host ones.
     sky_cluster_home = f'{workdir}/{cluster_name_on_cloud}'
     ready_file = f'{sky_cluster_home}/.sky_ready'
-    runner.run(f'rm -f {shlex.quote(ready_file)}',
-               require_outputs=True, separate_stderr=True, stream_logs=False)
+    topology_dir = f'{sky_cluster_home}/.sky/topology'
+    runner.run(
+        f'rm -f {shlex.quote(ready_file)} {shlex.quote(ready_file)}.* ; '
+        f'rm -rf {shlex.quote(topology_dir)}',
+        require_outputs=True, separate_stderr=True, stream_logs=False)
 
     # Submit job
     job_id = client.submit_job(
@@ -772,8 +842,8 @@ def run_instances(
     if image_id and enroot_enabled:
         ready_timeout = _get_timeout(provider_config, 'ready_timeout',
                                      lsf_utils.DEFAULT_READY_TIMEOUT)
-        _wait_for_ready_signal(runner, ready_file, cluster_name_on_cloud,
-                               ready_timeout)
+        _wait_for_all_ready_signals(runner, ready_file, cluster_name_on_cloud,
+                                    nodes, ready_timeout)
 
     return common.ProvisionRecord(
         provider_name='lsf',
@@ -844,30 +914,58 @@ def _wait_for_job_nodes(client: lsf_adaptor.LsfClient,
         f'to get nodes allocated after {timeout}s.')
 
 
-def _wait_for_ready_signal(runner,
-                           ready_file: str,
-                           cluster_name: str,
-                           timeout: int = lsf_utils.DEFAULT_READY_TIMEOUT
-                           ) -> None:
-    """Wait for the bsub script to signal readiness via a file on shared FS.
+def _wait_for_all_ready_signals(
+        runner,
+        ready_file: str,
+        cluster_name: str,
+        nodes: List[str],
+        timeout: int = lsf_utils.DEFAULT_READY_TIMEOUT) -> None:
+    """Wait until every allocated node has signalled readiness.
 
-    A negative timeout waits indefinitely. This window covers the step image's
-    `enroot import`, which is slow on a cold cache.
+    Each node touches ``<ready_file>.<short hostname>``; this waits for all of
+    them. Waiting on a single shared file would return as soon as the fastest
+    node was up, so the driver could start dispatching work to nodes whose
+    container had not been created yet.
+
+    Hostnames come from the LSF allocation, which may report fully-qualified
+    names while the job writes the short form (the script uses ``hostname -s``),
+    so compare on the first label only.
+
+    A negative timeout waits indefinitely. This window covers ``enroot import``,
+    which is slow on a cold cache.
     """
-    logger.info(f'Waiting {_wait_str(timeout)} for container readiness: '
-                f'{ready_file}')
+    short_names = [n.split('.')[0] for n in nodes]
+    expected = [f'{ready_file}.{n}' for n in short_names]
+    logger.info(f'Waiting {_wait_str(timeout)} for {len(expected)} node(s) to '
+                f'signal readiness: {ready_file}.<host>')
     start_time = time.time()
     while timeout < 0 or time.time() - start_time < timeout:
-        rc, _, _ = runner.run(
-            f'test -f {shlex.quote(ready_file)}',
-            require_outputs=True, separate_stderr=True, stream_logs=False)
+        test_expr = ' && '.join(f'test -f {shlex.quote(f)}' for f in expected)
+        rc, _, _ = runner.run(test_expr,
+                              require_outputs=True,
+                              separate_stderr=True,
+                              stream_logs=False)
         if rc == 0:
-            logger.info(f'Container ready for {cluster_name}')
+            logger.info(f'All {len(expected)} node(s) ready for {cluster_name}')
             return
         time.sleep(_POLL_INTERVAL)
+
+    # Name the outstanding nodes: with a multi-node job the useful question is
+    # never "did it time out" but "which host is stuck".
+    missing = []
+    for path, name in zip(expected, short_names):
+        rc, _, _ = runner.run(f'test -f {shlex.quote(path)}',
+                              require_outputs=True,
+                              separate_stderr=True,
+                              stream_logs=False)
+        if rc != 0:
+            missing.append(name)
+    detail = (f'Node(s) that never signalled: {", ".join(missing)}' if missing
+              else 'all signals appeared during the final probe (the timeout is '
+              'too tight for this cluster)')
     raise TimeoutError(
         f'Timed out waiting for container readiness for {cluster_name} '
-        f'after {timeout}s. File not found: {ready_file}')
+        f'after {timeout}s. {detail}')
 
 
 def wait_instances(

@@ -12,8 +12,8 @@
             local exit_code=$?
             set +e
             echo "[$(date)] Cleaning up SkyPilot LSF instance..."
-            # Signal dispatcher to shut down gracefully
-            [ -d "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky/dispatch" ] && touch "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky/dispatch/.shutdown"
+            # Signal this node's dispatcher to shut down gracefully
+            [ -n "${DISPATCH_DIR:-}" ] && [ -d "${DISPATCH_DIR}" ] &&                 touch "${DISPATCH_DIR}/.shutdown"
             # Kill background processes (enroot dispatcher, etc.)
             kill $(jobs -p) 2>/dev/null || true
             # Kill catatonit orphans (scoped to this job's process tree)
@@ -34,21 +34,50 @@
         mkdir -p "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/sky_logs" "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky"
         mkdir -p "/opt/nvme/$USER/skypilot-tmp"
 
-        # Remove stale ready signal from previous runs
-        rm -f "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_ready"
+        # Remove this node's stale ready signal from previous runs. Scoped to
+        # this host: a worker must not delete a peer's fresh signal.
+        rm -f "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_ready.$(hostname -s)"
 
         # Write marker file
         touch "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_lsf_cluster"
 
 
 
+        # === Compute topology ===
+NUM_GPUS_PER_NODE=$(nvidia-smi -L 2>/dev/null | wc -l || echo 0)
+TOTAL_NODES=$(echo "${LSB_HOSTS:-$(hostname)}" | tr ' ' '\n' | sort -u | wc -l)
+LOCAL_HOST=$(hostname -s)
+MASTER_HOST=$(echo "${LSB_HOSTS:-$(hostname -s)}" | awk '{print $1}')
+MASTER_PORT=$((29500 + (${LSB_JOBID:-0} % 1000)))
+
+RANK=0
+WORLD_SIZE=$TOTAL_NODES
+LOCAL_RANK=0
+
+export MASTER_ADDR="$MASTER_HOST"
+export MASTER_PORT RANK WORLD_SIZE LOCAL_RANK
+export NUM_GPUS_PER_NODE TOTAL_NODES
+echo "[$(date)] Topology: node=$LOCAL_HOST rank=$RANK/$WORLD_SIZE gpus=$NUM_GPUS_PER_NODE master=$MASTER_HOST:$MASTER_PORT"
+
+# Publish this node's rank so the driver can map host -> rank without
+# re-deriving it from a different source.
+TOPOLOGY_DIR="/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky/topology"
+mkdir -p "$TOPOLOGY_DIR"
+echo "$LOCAL_HOST" > "$TOPOLOGY_DIR/rank-$RANK"
+if [[ "$RANK" == "0" ]]; then
+    echo "$MASTER_HOST:$MASTER_PORT" > "$TOPOLOGY_DIR/master"
+fi
 
 
 
 
-        # Signal ready
-        touch "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_ready"
-        echo "SkyPilot LSF instance ready: sky-gold-kd-abc123"
+        # Signal ready: this node always, plus the legacy shared path from
+        # rank 0 so an older driver still sees a cluster come up.
+        touch "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_ready.$(hostname -s)"
+        if [[ "${RANK:-0}" == "0" ]]; then
+            touch "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky_ready"
+        fi
+        echo "SkyPilot LSF instance ready: sky-gold-kd-abc123 (node $(hostname -s), rank ${RANK:-0})"
 
         # Keep job alive until terminated
         if [[ -n "${ENROOT_PID:-}" ]]; then

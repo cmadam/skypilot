@@ -97,21 +97,21 @@ class TestBsubScriptSnapshots:
     def test_single_node_bare(self):
         """No container: the script tail is a bare `sleep infinity`."""
         script = lsf_instance._build_bsub_script(CLUSTER_NAME,
-                                                _base_provider_config(),
-                                                num_nodes=1)
+                                                 _base_provider_config(),
+                                                 num_nodes=1)
         assert_bsub_matches_snapshot('single_node_bare', script)
 
     def test_single_node_enroot(self):
         script = lsf_instance._build_bsub_script(CLUSTER_NAME,
-                                                _enroot_provider_config(),
-                                                num_nodes=1)
+                                                 _enroot_provider_config(),
+                                                 num_nodes=1)
         assert_bsub_matches_snapshot('single_node_enroot', script)
 
     def test_two_node_enroot(self):
         """The GOLD-distillation shape: 2 nodes x 8 GPUs, containerized."""
         script = lsf_instance._build_bsub_script(CLUSTER_NAME,
-                                                _enroot_provider_config(),
-                                                num_nodes=2)
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
         assert_bsub_matches_snapshot('two_node_enroot', script)
 
     def test_four_node_enroot_cpus(self):
@@ -124,8 +124,8 @@ class TestBsubScriptSnapshots:
         config = _enroot_provider_config()
         config['cpus'] = '8'
         script = lsf_instance._build_bsub_script(CLUSTER_NAME,
-                                                config,
-                                                num_nodes=4)
+                                                 config,
+                                                 num_nodes=4)
         assert_bsub_matches_snapshot('four_node_enroot_cpus', script)
 
 
@@ -145,16 +145,16 @@ class TestBsubScriptInvariants:
         host, silently collapsing a 4-node job onto a single machine.
         """
         script = lsf_instance._build_bsub_script(CLUSTER_NAME,
-                                                _enroot_provider_config(),
-                                                num_nodes=4)
+                                                 _enroot_provider_config(),
+                                                 num_nodes=4)
         assert '#BSUB -n 4' in script
         assert '#BSUB -R "span[ptile=1]"' in script
         assert '#BSUB -hl' in script
 
     def test_single_node_requests_no_span(self):
         script = lsf_instance._build_bsub_script(CLUSTER_NAME,
-                                                _enroot_provider_config(),
-                                                num_nodes=1)
+                                                 _enroot_provider_config(),
+                                                 num_nodes=1)
         assert '#BSUB -n 1' in script
         assert 'span[ptile' not in script
 
@@ -165,8 +165,8 @@ class TestBsubScriptInvariants:
         `bash -lc` here would break every step that relies on the image's venv.
         """
         script = lsf_instance._build_bsub_script(CLUSTER_NAME,
-                                                _enroot_provider_config(),
-                                                num_nodes=2)
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
         assert 'bash -lc' not in script
 
     def test_queue_options_override_cluster_options(self):
@@ -180,8 +180,191 @@ class TestBsubScriptInvariants:
             }
         }
         script = lsf_instance._build_bsub_script(CLUSTER_NAME,
-                                                config,
-                                                num_nodes=2)
+                                                 config,
+                                                 num_nodes=2)
         assert '#BSUB -q preemptable' in script
         assert '#BSUB -G grp_preemptable' in script
         assert '#BSUB -G grp_granite_dot_build' not in script
+
+
+class TestPerHostDispatch:
+    """Each node must own its dispatch directory.
+
+    A single shared directory cannot work for multi-node: every blaunch task runs
+    the same block, so each would `rm -rf` a directory its peers are using, and
+    whichever dispatcher noticed a cmd_*.sh first would run it.
+    """
+
+    def test_dispatch_dir_is_per_host(self):
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        assert 'DISPATCH_DIR="' in script
+        assert '/.sky/dispatch/$(hostname -s)"' in script
+
+    def test_shared_dispatch_root_is_never_removed(self):
+        """The `rm -rf` must target the per-host dir, never its parent."""
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=4)
+        assert 'rm -rf "$DISPATCH_DIR"' in script
+        assert 'rm -rf "/proj/granite-build/g4os/skypilot/'\
+               f'{CLUSTER_NAME}/.sky/dispatch"' not in script
+
+    def test_blaunch_targets_deduplicated_hosts(self):
+        """`blaunch -z <hosts>` launches once per host, not once per slot."""
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        assert 'blaunch -z "${UNIQUE_HOSTS[*]}" bash "$SHARED_SCRIPT"' in script
+
+    def test_unique_hosts_is_defined_before_blaunch_uses_it(self):
+        """Ordering: topology computes UNIQUE_HOSTS, blaunch consumes it.
+
+        Both live in separately-built blocks, so nothing but their assembly order
+        in _build_bsub_script keeps this sound — and getting it wrong would
+        expand to an empty host list, which blaunch accepts.
+        """
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        assert script.index('UNIQUE_HOSTS=($(echo "$LSB_HOSTS"') < script.index(
+            'blaunch -z "${UNIQUE_HOSTS[*]}"')
+
+
+class TestTopologyBlock:
+    """Topology is computed for every job, containerized or not."""
+
+    def test_bare_metal_gets_topology(self):
+        """A bare-metal job needs rank/master too, and must publish a manifest.
+
+        Before this, topology was emitted only when enroot was enabled, so a
+        non-container multi-node job had no rank at all.
+        """
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _base_provider_config(),
+                                                 num_nodes=2)
+        assert '=== Compute topology ===' in script
+        assert 'export MASTER_ADDR="$MASTER_HOST"' in script
+
+    def test_rank_manifest_is_published_by_the_job(self):
+        """The job records host -> rank; the driver must not re-derive it.
+
+        Driver-side rank (from `bjobs -o EXEC_HOST` order) and in-job rank (from
+        $LSB_HOSTS order) are independent derivations that LSF does not promise
+        to agree. A mismatched rank/master pairing does not fail fast: it hangs
+        NCCL init until the collective timeout.
+        """
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        assert 'TOPOLOGY_DIR="' in script
+        assert 'echo "$LOCAL_HOST" > "$TOPOLOGY_DIR/rank-$RANK"' in script
+        assert '$TOPOLOGY_DIR/master' in script
+
+    def test_single_node_skips_rank_detection(self):
+        """With one host there is nothing to search; rank is 0 by definition."""
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=1)
+        assert 'UNIQUE_HOSTS' not in script
+        assert 'RANK=0' in script
+
+    def test_master_port_is_derived_from_job_id(self):
+        """Two concurrent jobs must not pick the same rendezvous port."""
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        assert 'MASTER_PORT=$((29500 + (${LSB_JOBID:-0} % 1000)))' in script
+
+
+class TestReadySignals:
+    """Readiness is per node, so the driver can wait for the whole allocation."""
+
+    def test_each_node_signals_separately(self):
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        assert 'touch "/proj/granite-build/g4os/skypilot/'\
+               f'{CLUSTER_NAME}/.sky_ready.$(hostname -s)"' in script
+
+    def test_rank_zero_also_writes_the_legacy_shared_signal(self):
+        """Kept so a driver predating per-host signals still sees readiness."""
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        assert 'if [[ "${RANK:-0}" == "0" ]]; then' in script
+
+    def test_stale_signal_removal_is_scoped_to_this_host(self):
+        """A worker must not delete a peer's fresh signal on startup."""
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        assert 'rm -f "/proj/granite-build/g4os/skypilot/'\
+               f'{CLUSTER_NAME}/.sky_ready.$(hostname -s)"' in script
+
+
+class _StubRunner:
+    """Records `test -f` probes and answers from a set of existing paths."""
+
+    def __init__(self, existing):
+        self.existing = set(existing)
+        self.commands = []
+
+    def run(self, cmd, **kwargs):
+        self.commands.append(cmd)
+        # The waiter ANDs one `test -f <path>` per expected node.
+        paths = [
+            part.split('test -f ')[1].strip().strip("'")
+            for part in cmd.split('&&')
+            if 'test -f' in part
+        ]
+        rc = 0 if paths and all(p in self.existing for p in paths) else 1
+        return rc, '', ''
+
+
+class TestWaitForAllReadySignals:
+    """The driver must wait for every node, not for the fastest one."""
+
+    READY = '/proj/builds/cluster/.sky_ready'
+
+    def test_returns_when_all_nodes_signalled(self):
+        runner = _StubRunner([f'{self.READY}.host1', f'{self.READY}.host2'])
+        lsf_instance._wait_for_all_ready_signals(runner,
+                                                 self.READY,
+                                                 'cluster', ['host1', 'host2'],
+                                                 timeout=5)
+
+    def test_times_out_when_one_node_is_missing(self):
+        """And names the node that never signalled.
+
+        With a multi-node job the useful question is not "did it time out" but
+        "which host is stuck", so the message must identify it.
+        """
+        runner = _StubRunner([f'{self.READY}.host1'])
+        with pytest.raises(TimeoutError, match='host2'):
+            lsf_instance._wait_for_all_ready_signals(runner,
+                                                     self.READY,
+                                                     'cluster',
+                                                     ['host1', 'host2'],
+                                                     timeout=1)
+
+    def test_one_ready_node_does_not_satisfy_a_two_node_job(self):
+        """The regression this guards: a shared signal returned on first touch."""
+        runner = _StubRunner([f'{self.READY}.host1'])
+        with pytest.raises(TimeoutError):
+            lsf_instance._wait_for_all_ready_signals(runner,
+                                                     self.READY,
+                                                     'cluster',
+                                                     ['host1', 'host2'],
+                                                     timeout=1)
+
+    def test_fqdn_from_lsf_matches_short_name_written_by_the_job(self):
+        """LSF may report p1-r08-n4.bluevela.example.com; the job writes the
+        short name (`hostname -s`), so the comparison uses the first label."""
+        runner = _StubRunner([f'{self.READY}.host1', f'{self.READY}.host2'])
+        lsf_instance._wait_for_all_ready_signals(
+            runner,
+            self.READY,
+            'cluster', ['host1.bluevela.example.com', 'host2.example.com'],
+            timeout=5)
