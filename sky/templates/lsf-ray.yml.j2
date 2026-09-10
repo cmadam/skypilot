@@ -31,6 +31,8 @@ provider:
   # Resource configuration passed to provisioner
   cpus: "{{cpus}}"
   memory: "{{memory}}"
+  memory_explicit: "{{memory_explicit}}"
+  cpus_explicit: "{{cpus_explicit}}"
   accelerator_type: "{{accelerator_type}}"
   accelerator_count: "{{accelerator_count}}"
 {% if image_id %}

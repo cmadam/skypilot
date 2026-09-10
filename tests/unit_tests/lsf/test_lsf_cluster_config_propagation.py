@@ -122,6 +122,8 @@ class TestEnrootMountsReachTheScript:
             'cluster': 'bluevela',
             'cpus': '4',
             'memory': '64',
+            'memory_explicit': 'False',
+            'cpus_explicit': 'False',
             'accelerator_count': '8',
             'image_id': 'docker:example.io/img:1.0',
             'enroot_enabled': 'True',
@@ -263,6 +265,15 @@ class TestTemplateRendersProviderKeys:
     def test_enroot_mounts_omitted_when_empty(self):
         doc = self._render(enroot_mounts=[])
         assert 'enroot_mounts' not in doc['provider']
+
+    def test_resource_explicitness_flags_reach_provider_config(self):
+        """The provisioner cannot tell a requested value from a catalog default
+        on its own, so these two booleans are the whole basis of the
+        explicit-request-beats-bsub_options precedence. This is also the hop that
+        silently dropped enroot_mounts, so assert on the rendered document."""
+        doc = self._render(memory_explicit='True', cpus_explicit='False')
+        assert doc['provider']['memory_explicit'] == 'True'
+        assert doc['provider']['cpus_explicit'] == 'False'
 
     def test_nccl_tuning_file_reaches_provider_config(self):
         doc = self._render(nccl_tuning_file='/proj/bv-nccl.sh')

@@ -124,6 +124,20 @@ def _derive_shared_fs_roots(enroot_mounts: List[str]) -> List[str]:
     return list(dict.fromkeys(roots))  # de-dupe, preserving order
 
 
+# Precedence for #BSUB directives, lowest to highest:
+#
+#   1. derived defaults      — values the provisioner computes from a synthesized
+#                              instance type the user never asked for
+#   2. bsub_options          — cluster/queue config in ~/.sky/config.yaml, i.e. an
+#                              environment-wide policy
+#   3. explicit resources    — cpus/memory/accelerators the task actually
+#                              requested; the most specific statement of intent
+#
+# Level 3 above level 2 matters: an environment setting `M: 64G` as its default
+# must not cap a task that asks for 256G. Level 2 above level 1 matters because a
+# synthesized default (LSF's catalog gives 16GB when nothing is requested) should
+# never beat deliberate configuration.
+#
 # bsub options that LSF ACCUMULATES rather than resolving to a single value, so a
 # user-supplied one must not suppress the derived one.
 #
@@ -605,14 +619,20 @@ def _build_bsub_script(
     # option, so appending a user's value after ours silently ignored it — a
     # 16G default -M shadowed an environment's `M: 64G` and got a real training
     # job killed with TERM_MEMLIMIT at 46.5G of usage.
-    derived: List[Tuple[str, Optional[str]]] = [
-        ('J', cluster_name_on_cloud),
-        ('o', f'{sky_cluster_home}/sky_logs/%J.out'),
-        ('e', f'{sky_cluster_home}/sky_logs/%J.err'),
+    # (flag, value, explicit): `explicit` marks a value the task actually
+    # requested, which outranks bsub_options. Bookkeeping directives are never
+    # explicit, so an operator can always override them.
+    derived: List[Tuple[str, Optional[str], bool]] = [
+        ('J', cluster_name_on_cloud, False),
+        ('o', f'{sky_cluster_home}/sky_logs/%J.out', False),
+        ('e', f'{sky_cluster_home}/sky_logs/%J.err', False),
     ]
 
+    memory_explicit = provider_config.get('memory_explicit', 'False') == 'True'
+    cpus_explicit = provider_config.get('cpus_explicit', 'False') == 'True'
+
     if queue:
-        derived.append(('q', queue))
+        derived.append(('q', queue, False))
 
     # Slots and their distribution. LSF's -n counts *slots*, not hosts, so a
     # request for N nodes with C CPUs each is N*C slots pinned to C per host by
@@ -630,13 +650,15 @@ def _build_bsub_script(
                        f'{cluster_name_on_cloud}; requesting 1 slot per node.')
         cpus_per_node = 1
 
-    derived.append(('n', str(num_nodes * cpus_per_node)))
+    derived.append(('n', str(num_nodes * cpus_per_node), cpus_explicit))
     if cpus_per_node > 1 or num_nodes > 1:
-        derived.append(('R', f'"span[ptile={cpus_per_node}]"'))
+        derived.append(('R', f'"span[ptile={cpus_per_node}]"', cpus_explicit))
     if num_nodes > 1:
         # Host-level limits: resource limits apply per host rather than to the
-        # job as a whole.
-        derived.append(('hl', None))
+        # job as a whole. NOTE this is also what makes -M enforced — without it
+        # LSF treats the memory limit as advisory, which is why a single-node job
+        # can exceed it and survive while a multi-node one is killed.
+        derived.append(('hl', None, False))
 
     # GPU allocation. `num=` is per *task* by default, and a task is a slot, so
     # once there is more than one slot per host a per-task count multiplies:
@@ -646,12 +668,13 @@ def _build_bsub_script(
     # bare form is kept so existing clusters see a byte-identical directive.
     if int(acc_count) > 0:
         per = '/host' if cpus_per_node > 1 else ''
+        # Accelerators are only ever present because the task asked for them.
         derived.append(
-            ('gpu', f'"num={acc_count}{per}:mode=exclusive_process"'))
+            ('gpu', f'"num={acc_count}{per}:mode=exclusive_process"', True))
 
     mem_gb = int(float(memory))
     if mem_gb > 0:
-        derived.append(('M', f'{mem_gb}G'))
+        derived.append(('M', f'{mem_gb}G', memory_explicit))
 
     # Custom bsub options from config (per-queue overrides take precedence)
     bsub_options = dict(provider_config.get('bsub_options', {}))
@@ -660,16 +683,33 @@ def _build_bsub_script(
         if queue in queue_configs:
             bsub_options.update(queue_configs[queue].get('bsub_options', {}))
 
+    # Flags whose explicit request beats bsub_options; the bsub_options entry is
+    # then dropped rather than emitted alongside, since LSF would honour whichever
+    # came first and two values for one flag is never what was meant.
+    explicit_wins = {
+        flag
+        for flag, _, explicit in derived
+        if explicit and flag not in _ACCUMULATING_BSUB_FLAGS
+    }
+
     bsub_directives = []
-    for flag, value in derived:
-        if flag in bsub_options and flag not in _ACCUMULATING_BSUB_FLAGS:
+    for flag, value, explicit in derived:
+        overridden = (flag in bsub_options and
+                      flag not in _ACCUMULATING_BSUB_FLAGS and not explicit)
+        if overridden:
             logger.debug(
                 f'LSF: bsub_options -{flag}={bsub_options[flag]!r} overrides the '
-                f'derived -{flag} {value!r} for {cluster_name_on_cloud}.')
+                f'derived default -{flag} {value!r} for {cluster_name_on_cloud}.')
             continue
         bsub_directives.append(f'#BSUB -{flag}' +
                                (f' {value}' if value is not None else ''))
     for flag, value in bsub_options.items():
+        if flag in explicit_wins:
+            logger.info(
+                f'LSF: the task explicitly requested -{flag}, so it takes '
+                f'precedence over bsub_options -{flag}={value!r} for '
+                f'{cluster_name_on_cloud}.')
+            continue
         bsub_directives.append(f'#BSUB -{flag} {value}')
 
     directives_str = '\n'.join(bsub_directives)

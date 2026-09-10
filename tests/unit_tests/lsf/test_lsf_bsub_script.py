@@ -599,14 +599,17 @@ class TestBsubOptionsOverrideDerivedDirectives:
 
     @pytest.mark.parametrize('flag,value', [
         ('n', '99'),
-        ('gpu', '"num=1:mode=shared"'),
         ('q', 'special'),
         ('J', 'custom-name'),
     ])
-    def test_any_single_valued_flag_is_overridable(self, flag, value):
-        """Including the ones the provisioner computes. If a user overrides them
-        they take responsibility for the result, but it must actually take
-        effect rather than being silently dropped."""
+    def test_derived_default_flags_are_overridable(self, flag, value):
+        """Flags whose derived value is a default rather than a request.
+
+        `gpu` is deliberately absent: accelerators only appear because the task
+        asked for them, so they rank above bsub_options — see
+        TestExplicitResourcesOutrankBsubOptions. `n` is here because this fixture
+        does not mark cpus explicit; when it does, the request wins instead.
+        """
         config = _enroot_provider_config()
         config['bsub_options'] = {flag: value}
         directives = self._directives(config)
@@ -655,3 +658,89 @@ class TestBsubOptionsOverrideDerivedDirectives:
     def test_valueless_flags_render_without_a_value(self):
         config = _enroot_provider_config()
         assert '#BSUB -hl' in self._directives(config, num_nodes=2)
+
+
+class TestExplicitResourcesOutrankBsubOptions:
+    """Three-level precedence: derived default < bsub_options < explicit request.
+
+    The middle level alone is not enough. An environment that sets `M: 64G` as its
+    house default must not cap a task that asks for 256G — but it must still beat
+    the 16GB the LSF catalog invents when nothing is requested. Only the cloud
+    layer can tell those apart (Resources.memory is None when unspecified), which
+    is why memory_explicit/cpus_explicit are passed through provider_config.
+    """
+
+    def _directives(self, config, num_nodes=2):
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 config,
+                                                 num_nodes=num_nodes)
+        return [l for l in script.split('\n') if l.startswith('#BSUB')]
+
+    def test_explicit_memory_beats_bsub_options(self):
+        """The case that blocked the reference recipes: 64G was an un-raisable
+        ceiling because environment config outranked the task's own request."""
+        config = _enroot_provider_config()
+        config['memory'] = '256'
+        config['memory_explicit'] = 'True'
+        config['bsub_options'] = {'M': '64G'}
+        mem = [d for d in self._directives(config) if d.startswith('#BSUB -M')]
+        assert mem == ['#BSUB -M 256G'], mem
+
+    def test_default_memory_loses_to_bsub_options(self):
+        """Unrequested memory is a catalog artifact (16GB), not an intent."""
+        config = _enroot_provider_config()
+        config['memory'] = '16'
+        config['memory_explicit'] = 'False'
+        config['bsub_options'] = {'M': '64G'}
+        mem = [d for d in self._directives(config) if d.startswith('#BSUB -M')]
+        assert mem == ['#BSUB -M 64G'], mem
+
+    def test_explicit_cpus_beats_bsub_options(self):
+        config = _enroot_provider_config()
+        config['cpus'] = '8'
+        config['cpus_explicit'] = 'True'
+        config['bsub_options'] = {'n': '2'}
+        slots = [
+            d for d in self._directives(config) if d.startswith('#BSUB -n')
+        ]
+        assert slots == ['#BSUB -n 16'], slots
+
+    def test_accelerators_always_win(self):
+        """A GPU request is only ever present because the task made it."""
+        config = _enroot_provider_config()
+        config['bsub_options'] = {'gpu': '"num=1:mode=shared"'}
+        gpu = [
+            d for d in self._directives(config) if d.startswith('#BSUB -gpu')
+        ]
+        assert gpu == ['#BSUB -gpu "num=8/host:mode=exclusive_process"'], gpu
+
+    def test_bookkeeping_flags_remain_overridable(self):
+        """Job name, output paths and queue are never 'explicit', so an operator
+        keeps the escape hatch that motivated the override fix."""
+        config = _enroot_provider_config()
+        config['bsub_options'] = {'J': 'my-name', 'q': 'special'}
+        directives = self._directives(config)
+        assert '#BSUB -J my-name' in directives
+        assert f'#BSUB -J {CLUSTER_NAME}' not in directives
+        assert '#BSUB -q special' in directives
+
+    def test_no_flag_is_emitted_twice_when_explicit_wins(self):
+        """The losing bsub_options entry is dropped, not left alongside — LSF
+        would honour whichever came first."""
+        config = _enroot_provider_config()
+        config['memory'] = '256'
+        config['memory_explicit'] = 'True'
+        config['bsub_options'] = {'M': '64G', 'G': 'grp_x'}
+        directives = self._directives(config)
+        flags = [d.split()[1] for d in directives]
+        assert flags.count('-M') == 1, directives
+        assert '#BSUB -G grp_x' in directives
+
+    def test_explicitness_defaults_to_false_when_absent(self):
+        """Older cluster configs predate these keys; they must not crash, and the
+        conservative reading is 'not explicit'."""
+        config = _enroot_provider_config()
+        config.pop('memory_explicit', None)
+        config['bsub_options'] = {'M': '64G'}
+        mem = [d for d in self._directives(config) if d.startswith('#BSUB -M')]
+        assert mem == ['#BSUB -M 64G'], mem
