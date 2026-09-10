@@ -564,3 +564,94 @@ class TestGpuRequestIsPerHost:
                                                  config,
                                                  num_nodes=2)
         assert '#BSUB -gpu' not in script
+
+
+class TestBsubOptionsOverrideDerivedDirectives:
+    """A user-supplied bsub_options entry must REPLACE the derived directive.
+
+    LSF honours the FIRST occurrence of a single-valued option. Appending the
+    user's value after ours therefore ignored it silently, and the default
+    `memory` of 16 is small enough to matter: a real 2-node training job was
+    killed with TERM_MEMLIMIT at 46.5 GB of usage because a derived `-M 16G`
+    shadowed the environment's configured `M: 64G`. Nothing in the output said
+    so — the script contained both values and looked correct.
+    """
+
+    def _directives(self, config, num_nodes=2):
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 config,
+                                                 num_nodes=num_nodes)
+        return [l for l in script.split('\n') if l.startswith('#BSUB')]
+
+    def test_memory_is_emitted_once_with_the_user_value(self):
+        config = _enroot_provider_config()
+        config['memory'] = '16'  # the provisioner default that caused the kill
+        config['bsub_options'] = {'M': '64G'}
+        directives = self._directives(config)
+        mem = [d for d in directives if d.startswith('#BSUB -M')]
+        assert mem == ['#BSUB -M 64G'], mem
+
+    def test_derived_value_survives_when_not_overridden(self):
+        config = _enroot_provider_config()
+        config['memory'] = '32'
+        config['bsub_options'] = {'G': 'grp_x'}
+        assert '#BSUB -M 32G' in self._directives(config)
+
+    @pytest.mark.parametrize('flag,value', [
+        ('n', '99'),
+        ('gpu', '"num=1:mode=shared"'),
+        ('q', 'special'),
+        ('J', 'custom-name'),
+    ])
+    def test_any_single_valued_flag_is_overridable(self, flag, value):
+        """Including the ones the provisioner computes. If a user overrides them
+        they take responsibility for the result, but it must actually take
+        effect rather than being silently dropped."""
+        config = _enroot_provider_config()
+        config['bsub_options'] = {flag: value}
+        directives = self._directives(config)
+        matching = [d for d in directives if d.startswith(f'#BSUB -{flag} ')]
+        assert matching == [f'#BSUB -{flag} {value}'], matching
+
+    def test_resource_requirements_accumulate_rather_than_replace(self):
+        """-R is the exception: LSF ANDs multiple -R expressions.
+
+        Suppressing the derived `span[ptile=N]` because a user added a
+        `rusage[...]` would let LSF satisfy the slot count from fewer hosts,
+        silently collapsing a multi-node job onto one machine.
+        """
+        config = _enroot_provider_config()
+        config['bsub_options'] = {'R': '"rusage[mem=1000]"'}
+        directives = self._directives(config)
+        assert '#BSUB -R "span[ptile=4]"' in directives
+        assert '#BSUB -R "rusage[mem=1000]"' in directives
+
+    def test_queue_options_still_override_cluster_options(self):
+        config = _enroot_provider_config()
+        config['queue'] = 'preemptable'
+        config['queue_configs'] = {
+            'preemptable': {
+                'bsub_options': {
+                    'G': 'grp_preemptable'
+                }
+            }
+        }
+        directives = self._directives(config)
+        groups = [d for d in directives if d.startswith('#BSUB -G')]
+        assert groups == ['#BSUB -G grp_preemptable'], groups
+
+    def test_no_single_valued_flag_is_ever_emitted_twice(self):
+        """The property the bug violated, checked over the whole directive set."""
+        config = _enroot_provider_config()
+        config['bsub_options'] = {'M': '64G', 'G': 'grp_x', 'n': '4'}
+        directives = self._directives(config)
+        flags = [d.split()[1] for d in directives]
+        duplicated = {
+            f for f in flags
+            if flags.count(f) > 1 and f.lstrip('-') not in ('R',)
+        }
+        assert not duplicated, f'emitted twice: {duplicated}'
+
+    def test_valueless_flags_render_without_a_value(self):
+        config = _enroot_provider_config()
+        assert '#BSUB -hl' in self._directives(config, num_nodes=2)

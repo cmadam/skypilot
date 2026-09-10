@@ -6,7 +6,6 @@
 #BSUB -R "span[ptile=1]"
 #BSUB -hl
 #BSUB -gpu "num=8:mode=exclusive_process"
-#BSUB -M 64G
 #BSUB -G grp_granite_dot_build
 #BSUB -M 64G
 

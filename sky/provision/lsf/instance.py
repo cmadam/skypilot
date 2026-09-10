@@ -124,6 +124,18 @@ def _derive_shared_fs_roots(enroot_mounts: List[str]) -> List[str]:
     return list(dict.fromkeys(roots))  # de-dupe, preserving order
 
 
+# bsub options that LSF ACCUMULATES rather than resolving to a single value, so a
+# user-supplied one must not suppress the derived one.
+#
+# -R is the case that matters: LSF ANDs multiple -R expressions, so a user adding
+# `-R "rusage[mem=...]"` must not remove our `-R "span[ptile=N]"` — losing the
+# span term would let LSF satisfy the slot count from fewer hosts than requested,
+# silently collapsing a multi-node job. Every other option here is single-valued,
+# where LSF honours the first occurrence and the user's value must therefore
+# replace ours rather than follow it.
+_ACCUMULATING_BSUB_FLAGS = frozenset({'R'})
+
+
 def _get_client(provider_config: Dict[str, Any]) -> lsf_adaptor.LsfClient:
     """Create an LsfClient from provider config."""
     ssh_config = provider_config.get('ssh', {})
@@ -587,15 +599,20 @@ def _build_bsub_script(
 
     sky_cluster_home = f'{workdir}/{cluster_name_on_cloud}'
 
-    # Build #BSUB directives
-    bsub_directives = [
-        f'#BSUB -J {cluster_name_on_cloud}',
-        f'#BSUB -o {sky_cluster_home}/sky_logs/%J.out',
-        f'#BSUB -e {sky_cluster_home}/sky_logs/%J.err',
+    # Derived directives, as (flag, value) pairs rather than pre-rendered text,
+    # so a user-supplied bsub_options entry can REPLACE one instead of being
+    # appended after it. LSF honours the FIRST occurrence of a single-valued
+    # option, so appending a user's value after ours silently ignored it — a
+    # 16G default -M shadowed an environment's `M: 64G` and got a real training
+    # job killed with TERM_MEMLIMIT at 46.5G of usage.
+    derived: List[Tuple[str, Optional[str]]] = [
+        ('J', cluster_name_on_cloud),
+        ('o', f'{sky_cluster_home}/sky_logs/%J.out'),
+        ('e', f'{sky_cluster_home}/sky_logs/%J.err'),
     ]
 
     if queue:
-        bsub_directives.append(f'#BSUB -q {queue}')
+        derived.append(('q', queue))
 
     # Slots and their distribution. LSF's -n counts *slots*, not hosts, so a
     # request for N nodes with C CPUs each is N*C slots pinned to C per host by
@@ -613,13 +630,13 @@ def _build_bsub_script(
                        f'{cluster_name_on_cloud}; requesting 1 slot per node.')
         cpus_per_node = 1
 
-    bsub_directives.append(f'#BSUB -n {num_nodes * cpus_per_node}')
+    derived.append(('n', str(num_nodes * cpus_per_node)))
     if cpus_per_node > 1 or num_nodes > 1:
-        bsub_directives.append(f'#BSUB -R "span[ptile={cpus_per_node}]"')
+        derived.append(('R', f'"span[ptile={cpus_per_node}]"'))
     if num_nodes > 1:
         # Host-level limits: resource limits apply per host rather than to the
         # job as a whole.
-        bsub_directives.append('#BSUB -hl')
+        derived.append(('hl', None))
 
     # GPU allocation. `num=` is per *task* by default, and a task is a slot, so
     # once there is more than one slot per host a per-task count multiplies:
@@ -629,14 +646,12 @@ def _build_bsub_script(
     # bare form is kept so existing clusters see a byte-identical directive.
     if int(acc_count) > 0:
         per = '/host' if cpus_per_node > 1 else ''
-        gpu_directive = (f'#BSUB -gpu "num={acc_count}{per}'
-                         f':mode=exclusive_process"')
-        bsub_directives.append(gpu_directive)
+        derived.append(
+            ('gpu', f'"num={acc_count}{per}:mode=exclusive_process"'))
 
-    # Memory
     mem_gb = int(float(memory))
     if mem_gb > 0:
-        bsub_directives.append(f'#BSUB -M {mem_gb}G')
+        derived.append(('M', f'{mem_gb}G'))
 
     # Custom bsub options from config (per-queue overrides take precedence)
     bsub_options = dict(provider_config.get('bsub_options', {}))
@@ -644,8 +659,18 @@ def _build_bsub_script(
         queue_configs = provider_config.get('queue_configs', {})
         if queue in queue_configs:
             bsub_options.update(queue_configs[queue].get('bsub_options', {}))
-    for key, val in bsub_options.items():
-        bsub_directives.append(f'#BSUB -{key} {val}')
+
+    bsub_directives = []
+    for flag, value in derived:
+        if flag in bsub_options and flag not in _ACCUMULATING_BSUB_FLAGS:
+            logger.debug(
+                f'LSF: bsub_options -{flag}={bsub_options[flag]!r} overrides the '
+                f'derived -{flag} {value!r} for {cluster_name_on_cloud}.')
+            continue
+        bsub_directives.append(f'#BSUB -{flag}' +
+                               (f' {value}' if value is not None else ''))
+    for flag, value in bsub_options.items():
+        bsub_directives.append(f'#BSUB -{flag} {value}')
 
     directives_str = '\n'.join(bsub_directives)
 
