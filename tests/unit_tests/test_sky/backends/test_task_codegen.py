@@ -347,6 +347,8 @@ class TestRcloneFlushScript:
 # first means the fix shows up as a reviewable diff rather than a wall of new
 # code. See the M1 commit plan (A1) for the sequence.
 
+_LSF_HOME = '/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123'
+
 
 def _lsf_task_env_vars():
     return {
@@ -362,8 +364,11 @@ def test_lsf_single_node_dispatch():
     compute-node hop is the shared-filesystem dispatcher rather than srun.
     """
     codegen = task_codegen.LsfCodeGen(
-        container_dispatch_dir='/proj/granite-build/g4os/skypilot/'
-        'sky-gold-kd-abc123/.sky/dispatch',)
+        dispatch_root=_LSF_HOME + '/.sky/dispatch',
+        topology_dir=_LSF_HOME + '/.sky/topology',
+        nodes=['p1-r08-n4'],
+        node_ips=['10.0.0.1'],
+    )
     codegen.add_prologue(job_id=2)
 
     resources_dict = {'CPU': 4.0, 'GPU': 8.0}
@@ -405,8 +410,11 @@ def test_lsf_multi_node_2nodes():
     the bug directly rather than leaving it implicit in the golden file.
     """
     codegen = task_codegen.LsfCodeGen(
-        container_dispatch_dir='/proj/granite-build/g4os/skypilot/'
-        'sky-gold-kd-abc123/.sky/dispatch',)
+        dispatch_root=_LSF_HOME + '/.sky/dispatch',
+        topology_dir=_LSF_HOME + '/.sky/topology',
+        nodes=['p1-r08-n4', 'p1-r08-n5'],
+        node_ips=['10.0.0.1', '10.0.0.2'],
+    )
     codegen.add_prologue(job_id=2)
 
     resources_dict = {'CPU': 4.0, 'GPU': 8.0}
@@ -478,16 +486,21 @@ def test_lsf_multi_node_bare_metal():
                                     testdata_dir=LSF_TESTDATA_DIR)
 
 
-def test_lsf_multi_node_is_currently_single_node():
-    """State the multi-node bug as an assertion, not just a golden file.
+def test_lsf_multi_node_delegates_per_node_env_to_the_executor():
+    """State the multi-node contract as assertions, not just a golden file.
 
     A reviewer reading a large snapshot diff will not reliably notice that
-    SKYPILOT_NUM_NODES went from '1' to '2'. These assertions fail loudly the
-    moment the fix lands, which is the signal to update them to the correct
-    expectations rather than to regenerate a snapshot without reading it.
+    SKYPILOT_NUM_NODES stopped being pinned to 1. These assertions replace the
+    ones that recorded the defect: the generated code must no longer hardcode
+    rank 0, a single node, or loopback as the peer list, and must hand the
+    per-node work to the executor along with every allocated host.
     """
     codegen = task_codegen.LsfCodeGen(
-        container_dispatch_dir='/tmp/dispatch',)
+        dispatch_root='/tmp/dispatch',
+        topology_dir='/tmp/topology',
+        nodes=['host1', 'host2'],
+        node_ips=['10.0.0.1', '10.0.0.2'],
+    )
     codegen.add_prologue(job_id=2)
     codegen.add_setup(
         2,
@@ -508,14 +521,20 @@ def test_lsf_multi_node_is_currently_single_node():
     codegen.add_epilogue()
     code = codegen.build()
 
-    # The task is told it is alone on one node, and is given loopback as the
-    # peer list, so any rank-aware workload silently degenerates to rank 0.
-    assert "sky_env_vars_dict['SKYPILOT_NODE_RANK'] = 0" in code
-    assert "sky_env_vars_dict['SKYPILOT_NODE_IPS'] = '127.0.0.1'" in code
-    assert "'SKYPILOT_NUM_NODES'] = 1" in code
-    assert '10.0.0.2' not in code, (
-        'the second node\'s IP never reaches the generated code')
+    # No per-node value is decided here any more; the executor sets them once it
+    # knows each node's rank.
+    assert "sky_env_vars_dict['SKYPILOT_NODE_RANK'] = 0" not in code
+    assert "sky_env_vars_dict['SKYPILOT_NODE_IPS'] = '127.0.0.1'" not in code
+    assert "'SKYPILOT_NUM_NODES'] = 1" not in code
 
-    # Setup collides across nodes: the sequence name is a constant, so N nodes
-    # would contend for one cmd_setup.sh / rc_setup pair.
-    assert "seq = 'setup'" in code
+    # Both hosts reach the executor, for the task and for setup.
+    assert code.count('lsf_executor.run_on_all_nodes(') == 2
+    assert "nodes=['host1', 'host2']" in code
+    assert "node_ips=['10.0.0.1', '10.0.0.2']" in code
+    assert "topology_dir='/tmp/topology'" in code
+    assert 'is_setup=True' in code
+    assert 'is_setup=False' in code
+
+    # Setup no longer writes to a fixed 'setup' sequence name, which N nodes
+    # would have contended for.
+    assert "seq = 'setup'" not in code

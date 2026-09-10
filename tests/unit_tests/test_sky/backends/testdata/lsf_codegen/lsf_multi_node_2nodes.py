@@ -424,25 +424,20 @@ message = ('[2m├── [0m[2m'
            'Waiting for task resources on '
            f'{node_str}.[0m')
 print(message, flush=True)
-setup_env = {}
-setup_env['SKYPILOT_NUM_NODES'] = '1'
-setup_env['SKYPILOT_NODE_RANK'] = '0'
-setup_env['SKYPILOT_INTERNAL_JOB_ID'] = str(2)
-setup_log = os.path.expanduser(os.path.join('/sky/logs', 'setup.log'))
-dispatch_dir = '/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky/dispatch'
-seq = 'setup'
-cmd_path = os.path.join(dispatch_dir, f'cmd_{seq}.sh')
-env_lines = '\n'.join(f'export {k}="{v}"' for k, v in setup_env.items())
-with open(cmd_path, 'w') as f:
-    f.write(env_lines + '\n' + 'echo no-op setup\n__skypilot_user_exit_code=$?\n# Only waits if cached mount is enabled (RCLONE_MOUNT_CACHED_LOG_DIR is not empty)\n# findmnt alone is not enough, as some clouds (e.g. AWS on ARM64) uses\n# rclone for normal mounts as well.\nif [ $(findmnt -t fuse.rclone --noheading | wc -l) -gt 0 ] &&            [ -d ~/.sky/rclone_log ] &&            [ "$(ls -A ~/.sky/rclone_log)" ]; then\n    FLUSH_START_TIME=$(date +%s)\n    flushed=0\n    # extra second on top of --vfs-cache-poll-interval to\n    # avoid race condition between rclone log line creation and this check.\n    sleep 1\n    while [ $flushed -eq 0 ]; do\n        # sleep for the same interval as --vfs-cache-poll-interval\n        sleep 10\n        flushed=1\n        for file in ~/.sky/rclone_log/*; do\n            exitcode=0\n            tac $file | grep "vfs cache: cleaned:" -m 1 | grep "in use 0, to upload 0, uploading 0" -q || exitcode=$?\n            if [ $exitcode -ne 0 ]; then\n                ELAPSED=$(($(date +%s) - FLUSH_START_TIME))\n                # Extract the last vfs cache status line to show what we\'re waiting for\n                CACHE_STATUS=$(tac $file | grep "vfs cache: cleaned:" -m 1 | sed \'s/.*vfs cache: cleaned: //\' 2>/dev/null)\n                # Extract currently uploading files from recent log lines (show up to 2 files)\n                UPLOADING_FILES=$(tac $file | head -30 | grep -E "queuing for upload" | head -2 | sed \'s/.*INFO  : //\' | sed \'s/: vfs cache:.*//\' | tr \'\\n\' \',\' | sed \'s/,$//\' | sed \'s/,/, /g\' 2>/dev/null)\n                # Build status message with available info\n                if [ -n "$CACHE_STATUS" ] && [ -n "$UPLOADING_FILES" ]; then\n                    echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s) [${CACHE_STATUS}] uploading: ${UPLOADING_FILES}"\n                elif [ -n "$CACHE_STATUS" ]; then\n                    echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s) [${CACHE_STATUS}]"\n                else\n                    # Fallback: show last non-empty line from log\n                    LAST_LINE=$(tac $file | grep -v "^$" | head -1 | sed \'s/.*INFO  : //\' | sed \'s/.*ERROR : //\' | sed \'s/.*NOTICE: //\' 2>/dev/null)\n                    if [ -n "$LAST_LINE" ]; then\n                        echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s) ${LAST_LINE}"\n                    else\n                        echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s)"\n                    fi\n                fi\n                flushed=0\n                break\n            fi\n        done\n    done\n    TOTAL_FLUSH_TIME=$(($(date +%s) - FLUSH_START_TIME))\n    echo "skypilot: cached mount upload complete (took ${TOTAL_FLUSH_TIME}s)"\nfi\nexit $__skypilot_user_exit_code')
-rc_path = os.path.join(dispatch_dir, f'rc_{seq}')
-out_path = os.path.join(dispatch_dir, f'out_{seq}.log')
-while not os.path.exists(rc_path):
-    time.sleep(0.5)
-with open(rc_path) as f:
-    setup_rc = int(f.read().strip())
-os.makedirs(os.path.dirname(setup_log), exist_ok=True)
-shutil.copy(out_path, setup_log)
+from sky.skylet.executor import lsf as lsf_executor
+setup_rc = lsf_executor.run_on_all_nodes(
+    script='echo no-op setup\n__skypilot_user_exit_code=$?\n# Only waits if cached mount is enabled (RCLONE_MOUNT_CACHED_LOG_DIR is not empty)\n# findmnt alone is not enough, as some clouds (e.g. AWS on ARM64) uses\n# rclone for normal mounts as well.\nif [ $(findmnt -t fuse.rclone --noheading | wc -l) -gt 0 ] &&            [ -d ~/.sky/rclone_log ] &&            [ "$(ls -A ~/.sky/rclone_log)" ]; then\n    FLUSH_START_TIME=$(date +%s)\n    flushed=0\n    # extra second on top of --vfs-cache-poll-interval to\n    # avoid race condition between rclone log line creation and this check.\n    sleep 1\n    while [ $flushed -eq 0 ]; do\n        # sleep for the same interval as --vfs-cache-poll-interval\n        sleep 10\n        flushed=1\n        for file in ~/.sky/rclone_log/*; do\n            exitcode=0\n            tac $file | grep "vfs cache: cleaned:" -m 1 | grep "in use 0, to upload 0, uploading 0" -q || exitcode=$?\n            if [ $exitcode -ne 0 ]; then\n                ELAPSED=$(($(date +%s) - FLUSH_START_TIME))\n                # Extract the last vfs cache status line to show what we\'re waiting for\n                CACHE_STATUS=$(tac $file | grep "vfs cache: cleaned:" -m 1 | sed \'s/.*vfs cache: cleaned: //\' 2>/dev/null)\n                # Extract currently uploading files from recent log lines (show up to 2 files)\n                UPLOADING_FILES=$(tac $file | head -30 | grep -E "queuing for upload" | head -2 | sed \'s/.*INFO  : //\' | sed \'s/: vfs cache:.*//\' | tr \'\\n\' \',\' | sed \'s/,$//\' | sed \'s/,/, /g\' 2>/dev/null)\n                # Build status message with available info\n                if [ -n "$CACHE_STATUS" ] && [ -n "$UPLOADING_FILES" ]; then\n                    echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s) [${CACHE_STATUS}] uploading: ${UPLOADING_FILES}"\n                elif [ -n "$CACHE_STATUS" ]; then\n                    echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s) [${CACHE_STATUS}]"\n                else\n                    # Fallback: show last non-empty line from log\n                    LAST_LINE=$(tac $file | grep -v "^$" | head -1 | sed \'s/.*INFO  : //\' | sed \'s/.*ERROR : //\' | sed \'s/.*NOTICE: //\' 2>/dev/null)\n                    if [ -n "$LAST_LINE" ]; then\n                        echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s) ${LAST_LINE}"\n                    else\n                        echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s)"\n                    fi\n                fi\n                flushed=0\n                break\n            fi\n        done\n    done\n    TOTAL_FLUSH_TIME=$(($(date +%s) - FLUSH_START_TIME))\n    echo "skypilot: cached mount upload complete (took ${TOTAL_FLUSH_TIME}s)"\nfi\nexit $__skypilot_user_exit_code',
+    env_vars={},
+    dispatch_root='/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky/dispatch',
+    topology_dir='/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky/topology',
+    nodes=['p1-r08-n4', 'p1-r08-n5'],
+    node_ips=['10.0.0.1', '10.0.0.2'],
+    log_dir='/sky/logs',
+    num_gpus_per_node=8,
+    job_id=2,
+    task_name=None,
+    is_setup=True,
+)
 if setup_rc != 0:
     job_lib.set_status(2, job_lib.JobStatus.FAILED_SETUP)
     print(f'ERROR: Setup failed with return code {setup_rc}', flush=True)
@@ -459,46 +454,20 @@ sky_env_vars_dict['MODEL_NAME'] = 'granite-4.1-3b-base'
 script = 'accelerate launch gold/gold.py\n__skypilot_user_exit_code=$?\n# Only waits if cached mount is enabled (RCLONE_MOUNT_CACHED_LOG_DIR is not empty)\n# findmnt alone is not enough, as some clouds (e.g. AWS on ARM64) uses\n# rclone for normal mounts as well.\nif [ $(findmnt -t fuse.rclone --noheading | wc -l) -gt 0 ] &&            [ -d ~/.sky/rclone_log ] &&            [ "$(ls -A ~/.sky/rclone_log)" ]; then\n    FLUSH_START_TIME=$(date +%s)\n    flushed=0\n    # extra second on top of --vfs-cache-poll-interval to\n    # avoid race condition between rclone log line creation and this check.\n    sleep 1\n    while [ $flushed -eq 0 ]; do\n        # sleep for the same interval as --vfs-cache-poll-interval\n        sleep 10\n        flushed=1\n        for file in ~/.sky/rclone_log/*; do\n            exitcode=0\n            tac $file | grep "vfs cache: cleaned:" -m 1 | grep "in use 0, to upload 0, uploading 0" -q || exitcode=$?\n            if [ $exitcode -ne 0 ]; then\n                ELAPSED=$(($(date +%s) - FLUSH_START_TIME))\n                # Extract the last vfs cache status line to show what we\'re waiting for\n                CACHE_STATUS=$(tac $file | grep "vfs cache: cleaned:" -m 1 | sed \'s/.*vfs cache: cleaned: //\' 2>/dev/null)\n                # Extract currently uploading files from recent log lines (show up to 2 files)\n                UPLOADING_FILES=$(tac $file | head -30 | grep -E "queuing for upload" | head -2 | sed \'s/.*INFO  : //\' | sed \'s/: vfs cache:.*//\' | tr \'\\n\' \',\' | sed \'s/,$//\' | sed \'s/,/, /g\' 2>/dev/null)\n                # Build status message with available info\n                if [ -n "$CACHE_STATUS" ] && [ -n "$UPLOADING_FILES" ]; then\n                    echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s) [${CACHE_STATUS}] uploading: ${UPLOADING_FILES}"\n                elif [ -n "$CACHE_STATUS" ]; then\n                    echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s) [${CACHE_STATUS}]"\n                else\n                    # Fallback: show last non-empty line from log\n                    LAST_LINE=$(tac $file | grep -v "^$" | head -1 | sed \'s/.*INFO  : //\' | sed \'s/.*ERROR : //\' | sed \'s/.*NOTICE: //\' 2>/dev/null)\n                    if [ -n "$LAST_LINE" ]; then\n                        echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s) ${LAST_LINE}"\n                    else\n                        echo "skypilot: cached mount is still uploading (elapsed: ${ELAPSED}s)"\n                    fi\n                fi\n                flushed=0\n                break\n            fi\n        done\n    done\n    TOTAL_FLUSH_TIME=$(($(date +%s) - FLUSH_START_TIME))\n    echo "skypilot: cached mount upload complete (took ${TOTAL_FLUSH_TIME}s)"\nfi\nexit $__skypilot_user_exit_code'
 
 if script:
-    sky_env_vars_dict['SKYPILOT_NUM_GPUS_PER_NODE'] = 8
-    sky_env_vars_dict['SKYPILOT_NODE_RANK'] = 0
-    sky_env_vars_dict['SKYPILOT_NODE_IPS'] = '127.0.0.1'
-    sky_env_vars_dict['SKYPILOT_NUM_NODES'] = 1
-
-    dispatch_dir = '/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky/dispatch'
-    seq = str(uuid.uuid4())[:8]
-    cmd_path = os.path.join(dispatch_dir, f'cmd_{seq}.sh')
-    env_lines = '\n'.join(f'export {k}="{v}"' for k, v in sky_env_vars_dict.items())
-    with open(cmd_path, 'w') as f:
-        f.write(env_lines + '\n' + script)
-
-    log_path = os.path.expanduser(os.path.join('/sky/logs/tasks', 'run.log'))
-    rc_path = os.path.join(dispatch_dir, f'rc_{seq}')
-    out_path = os.path.join(dispatch_dir, f'out_{seq}.log')
-
-    # Stream output in real-time while waiting for completion
-    last_pos = 0
-    while not os.path.exists(rc_path):
-        if os.path.exists(out_path):
-            with open(out_path) as f:
-                f.seek(last_pos)
-                new_data = f.read()
-                if new_data:
-                    print(new_data, end='', flush=True)
-                    last_pos = f.tell()
-        time.sleep(0.5)
-    # Flush any remaining output after command completes
-    if os.path.exists(out_path):
-        with open(out_path) as f:
-            f.seek(last_pos)
-            remaining = f.read()
-            if remaining:
-                print(remaining, end='', flush=True)
-
-    with open(rc_path) as f:
-        return_code = int(f.read().strip())
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    shutil.copy(out_path, log_path)
-    returncodes = [return_code]
+    from sky.skylet.executor import lsf as lsf_executor
+    returncodes = [lsf_executor.run_on_all_nodes(
+        script=script,
+        env_vars=sky_env_vars_dict,
+        dispatch_root='/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky/dispatch',
+        topology_dir='/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky/topology',
+        nodes=['p1-r08-n4', 'p1-r08-n5'],
+        node_ips=['10.0.0.1', '10.0.0.2'],
+        log_dir='/sky/logs/tasks',
+        num_gpus_per_node=8,
+        job_id=2,
+        task_name='gold_distill',
+        is_setup=False,
+    )]
 else:
     returncodes = [0]
 
