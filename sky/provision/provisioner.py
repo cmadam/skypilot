@@ -447,6 +447,49 @@ def wait_for_ssh(cluster_info: provision_common.ClusterInfo,
                                      list(zip(ips, ssh_ports)))
 
 
+def _head_only_cluster_info(
+        cluster_info: provision_common.ClusterInfo
+) -> provision_common.ClusterInfo:
+    """Return a view of the cluster containing only its head instance.
+
+    For clouds whose instances all resolve to the same machine, per-instance
+    setup must not be repeated per instance. On LSF every allocated node is
+    reached through the one login node, so the N instances share a filesystem, a
+    SkyPilot runtime directory and an sshd. Running per-instance setup over all
+    of them means N concurrent identical installs writing the same paths, plus N
+    simultaneous SSH authentications against a server that caps them
+    (MaxAuthTries) — presenting as a corrupt half-installed runtime or as
+    intermittent auth failures that look like a network problem.
+
+    Only the setup stages take this view. The runners used to execute the user's
+    task still cover every node.
+    """
+    head_id = cluster_info.head_instance_id
+    assert head_id is not None, ('head_instance_id must be set to narrow the '
+                                 'cluster to its head instance')
+    return dataclasses.replace(
+        cluster_info,
+        instances={head_id: cluster_info.instances[head_id]},
+    )
+
+
+def _cluster_info_for_setup(
+        cloud_name: str, cluster_info: provision_common.ClusterInfo
+) -> provision_common.ClusterInfo:
+    """Return the ClusterInfo the per-instance setup stages should use.
+
+    Identical to the full cluster everywhere except LSF, where all instances are
+    reached through one login node and so must be set up once. See
+    _head_only_cluster_info.
+    """
+    if cloud_name.lower() == 'lsf' and cluster_info.num_instances > 1:
+        logger.debug(f'LSF: running cluster setup once for '
+                     f'{cluster_info.num_instances} instances sharing one '
+                     f'login node.')
+        return _head_only_cluster_info(cluster_info)
+    return cluster_info
+
+
 def _post_provision_setup(
         launched_resources: resources_lib.Resources,
         cluster_name: resources_utils.ClusterName, handle_cluster_yaml: str,
@@ -584,17 +627,21 @@ def _post_provision_setup(
             'Preparing SkyPilot runtime ({step}/3 - {step_name})',
             provision_logging.config.log_path,
             cluster_name=str(cluster_name)))
+        # On LSF every instance is reached through the same login node, so the
+        # per-instance setup stages below run once rather than once per node.
+        setup_cluster_info = _cluster_info_for_setup(cloud_name, cluster_info)
+
         status.update(
             runtime_preparation_str.format(step=1, step_name='initializing'))
         instance_setup.internal_file_mounts(cluster_name.name_on_cloud,
-                                            file_mounts, cluster_info,
+                                            file_mounts, setup_cluster_info,
                                             ssh_credentials)
 
         status.update(
             runtime_preparation_str.format(step=2, step_name='dependencies'))
         instance_setup.setup_runtime_on_cluster(
             cluster_name.name_on_cloud, config_from_yaml['setup_commands'],
-            cluster_info, ssh_credentials)
+            setup_cluster_info, ssh_credentials)
 
         runners = provision.get_command_runners(cloud_name, cluster_info,
                                                 **ssh_credentials)
@@ -733,7 +780,7 @@ def _post_provision_setup(
                                          provision_logging.config.log_path,
                                          cluster_name=str(cluster_name)))
             instance_setup.setup_logging_on_cluster(logging_agent, cluster_name,
-                                                    cluster_info,
+                                                    setup_cluster_info,
                                                     ssh_credentials)
 
         instance_setup.start_skylet_on_head_node(cluster_name, cluster_info,
