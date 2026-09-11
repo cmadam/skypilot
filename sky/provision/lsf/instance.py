@@ -1336,14 +1336,6 @@ def get_command_runners(
     sky_cluster_home_dir = _sky_cluster_home_dir(sky_base_dir,
                                                   cluster_name_on_cloud)
 
-    # Enable dispatch mode when container is active — routes commands
-    # to the compute node via the shared-FS dispatcher in the container.
-    image_id = provider_config.get('image_id')
-    enroot_enabled = provider_config.get('enroot', {}).get('enabled', False)
-    dispatch_dir = None
-    if image_id and enroot_enabled:
-        dispatch_dir = f'{sky_cluster_home_dir}/.sky/dispatch'
-
     # Shared-FS roots whose file_mounts the backend must not symlink-wrap.
     # Homogeneous per cluster, so derive once and log it: a misplaced payload
     # (e.g. an enroot_mount wrongly classified as shared) otherwise leaves no
@@ -1365,8 +1357,14 @@ def get_command_runners(
             ssh_proxy_jump=login_node_ssh_proxy_jump,
             ssh_control_name=ssh_control_name,
             disable_identities_only=True,
-            dispatch_dir=dispatch_dir,
             shared_fs_roots=shared_fs_roots,
+            # Node identity, from the tags get_cluster_info already sets. Without
+            # these every runner of a multi-node cluster was byte-identical, so
+            # "do this on node 3" was not expressible. Commands still execute on
+            # the login node by design — see LsfCommandRunner's docstring.
+            job_id=(instance_info.tags or {}).get('job_id'),
+            lsf_node=(instance_info.tags or {}).get('node'),
+            node_rank=int((instance_info.tags or {}).get('rank', 0) or 0),
         ) for instance_info in instances
     ]
 
