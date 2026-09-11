@@ -368,6 +368,14 @@ class LSF(clouds.Cloud):
             'instance_type': resources.instance_type,
             'cpus': str(inst.cpus),
             'memory': str(inst.memory),
+            # Whether the user actually asked for these, as opposed to their
+            # value coming from the synthesized instance type's defaults.
+            # Resources.memory/.cpus are None when unspecified, while inst.*
+            # always carries a number, so the provisioner cannot tell the two
+            # apart on its own — and it must, to order an explicit per-task
+            # request above an environment-wide bsub_options default.
+            'memory_explicit': str(resources.memory is not None),
+            'cpus_explicit': str(resources.cpus is not None),
             'lsf_cluster': cluster,
             'lsf_queue': queue,
             'num_nodes': str(num_nodes),
@@ -392,7 +400,8 @@ class LSF(clouds.Cloud):
             'enroot_share_path': enroot_config['share_path'],
             'enroot_use_local_nvme': str(enroot_config['use_local_nvme']),
             'enroot_squash_options': enroot_config['squash_options'],
-            'nccl_tuning_file': enroot_config.get('nccl_tuning_file', ''),
+            'nccl_tuning_file': lsf_utils.get_nccl_tuning_file(cluster),
+            'enroot_mounts': lsf_utils.get_enroot_mounts(cluster),
             'workdir': lsf_utils.get_workdir(cluster) or '',
             'tmpdir': lsf_utils.get_tmpdir(cluster) or '',
         }

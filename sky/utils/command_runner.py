@@ -1944,6 +1944,19 @@ class LsfCommandRunner(SSHCommandRunner):
     case where rsync is banned on login nodes by specifying the full path to the
     real rsync binary via --rsync-path. Shared-FS roots passed as
     ``shared_fs_roots`` are surfaced via get_unwrapped_mount_prefixes().
+
+    Commands run on the login node deliberately, not on the compute nodes. What
+    the backend sends through a runner is cluster setup — the SkyPilot runtime
+    install, internal file mounts, the logging agent — all of which write into the
+    shared-filesystem cluster home so every node can read them. Dispatching those
+    to a compute node would install the runtime inside a container that is then
+    discarded, on a filesystem the next node cannot see. The task itself does not
+    come through here: sky.skylet.executor.lsf dispatches it per node.
+
+    ``job_id``/``lsf_node``/``node_rank`` identify which allocated node this runner
+    corresponds to, mirroring SlurmCommandRunner. They make the N runners of a
+    multi-node cluster distinguishable — previously every one was byte-identical —
+    and are what any future per-node operation would address a host by.
     """
 
     _ENV_SETUP = 'export UV_CACHE_DIR=/tmp/uv_cache_$(id -u)'
@@ -1957,8 +1970,10 @@ class LsfCommandRunner(SSHCommandRunner):
         sky_dir: str,
         skypilot_runtime_dir: str,
         remote_rsync_path: str = '/usr/bin/rsync',
-        dispatch_dir: Optional[str] = None,
         shared_fs_roots: Optional[List[str]] = None,
+        job_id: Optional[str] = None,
+        lsf_node: Optional[str] = None,
+        node_rank: Optional[int] = None,
         **kwargs,
     ):
         """Initialize the LSF login-node command runner.
@@ -1968,12 +1983,20 @@ class LsfCommandRunner(SSHCommandRunner):
                 the enroot container (e.g. ``['/proj']``); file_mount
                 destinations under these are exempt from the backend's
                 symlink-wrap. Defaults to no exemptions.
+            job_id: the LSF job holding this node's allocation.
+            lsf_node: the allocated hostname this runner corresponds to.
+            node_rank: the driver-side index of that host in the allocation. NOT
+                the job's own rank — the job derives that from $LSB_HOSTS and the
+                two orderings are not guaranteed to agree, so this must not be
+                used to address a rank.
         """
         super().__init__(node, ssh_user, ssh_private_key, **kwargs)
         self.sky_dir = sky_dir
         self.skypilot_runtime_dir = skypilot_runtime_dir
         self.remote_rsync_path = remote_rsync_path
-        self.dispatch_dir = dispatch_dir
+        self.job_id = job_id
+        self.lsf_node = lsf_node
+        self.node_rank = node_rank
         self._shared_fs_roots: List[str] = list(shared_fs_roots or [])
 
     def get_unwrapped_mount_prefixes(self) -> List[str]:
@@ -2124,28 +2147,6 @@ class LsfCommandRunner(SSHCommandRunner):
                                            stderr=stdout + stderr,
                                            stream_logs=stream_logs)
 
-    def _wrap_with_dispatch(self, cmd: str) -> str:
-        """Wrap a command to execute on the compute node via shared-FS dispatch.
-
-        The dispatch directory is monitored by a dispatcher daemon running
-        inside the enroot container on the compute node. This method writes
-        the command to a file in that directory, then polls for the result.
-        """
-        escaped_cmd = cmd.replace("'", "'\\''")
-        return (
-            f'SEQ=$(cat /dev/urandom | tr -dc "a-z0-9" | head -c8) && '
-            f'DDIR="{self.dispatch_dir}" && '
-            f'CMD_FILE="$DDIR/cmd_$SEQ.sh" && '
-            f"printf '%s\\n' '{escaped_cmd}' > \"$CMD_FILE\" && "
-            f'TIMEOUT=1800 && WAITED=0 && '
-            f'while [ ! -f "$DDIR/rc_$SEQ" ]; do '
-            f'sleep 0.3; WAITED=$((WAITED + 1)); '
-            f'if [ $WAITED -gt $((TIMEOUT * 3)) ]; then '
-            f'echo "ERROR: dispatch timeout after ${TIMEOUT}s"; exit 124; '
-            f'fi; done && '
-            f'cat "$DDIR/out_$SEQ.log" && '
-            f'exit $(cat "$DDIR/rc_$SEQ")')
-
     def _login_preamble(self) -> str:
         """Preamble for commands running directly on the login node."""
         return (
@@ -2169,14 +2170,13 @@ class LsfCommandRunner(SSHCommandRunner):
         kwargs['source_bashrc'] = False
         cmd_stripped = cmd.strip().lstrip(';').strip()
 
-        if self.dispatch_dir and cmd_stripped:
-            inner_cmd = self._wrap_with_dispatch(cmd_stripped)
+        # Always the login node — see the class docstring. The task is dispatched
+        # per node by sky.skylet.executor.lsf, not from here.
+        preamble = self._login_preamble()
+        if cmd_stripped:
+            inner_cmd = f'{preamble} && {cmd_stripped}'
         else:
-            preamble = self._login_preamble()
-            if cmd_stripped:
-                inner_cmd = f'{preamble} && {cmd_stripped}'
-            else:
-                inner_cmd = preamble
+            inner_cmd = preamble
         return SSHCommandRunner.run(self, inner_cmd, **kwargs)
 
     @timeline.event

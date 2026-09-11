@@ -427,7 +427,12 @@ def get_enroot_config(cluster: str) -> Dict[str, Any]:
     """Get the enroot configuration for an LSF cluster from sky config.
 
     Returns config dict with keys: enabled, share_path, use_local_nvme,
-    squash_options, nccl_tuning_file.
+    squash_options.
+
+    Note that nccl_tuning_file and enroot_mounts are NOT here: the schema places
+    both at cluster level, as siblings of `enroot` rather than inside it (and
+    `enroot` sets additionalProperties: False, so they could not be nested even
+    if a user tried). See get_nccl_tuning_file() and get_enroot_mounts().
     """
     config = skypilot_config.get_nested(
         ('lsf', 'cluster_configs', cluster, 'enroot'), {})
@@ -437,8 +442,30 @@ def get_enroot_config(cluster: str) -> Dict[str, Any]:
         'use_local_nvme': config.get('use_local_nvme', False),
         'squash_options': config.get('squash_options',
                                      '-comp lz4 -Xhc -no-xattrs'),
-        'nccl_tuning_file': config.get('nccl_tuning_file', ''),
     }
+
+
+def get_nccl_tuning_file(cluster: str) -> str:
+    """Get the NCCL tuning script to source on each node, from sky config.
+
+    Read from cluster level, where the schema defines it. It was previously read
+    from inside the `enroot` block, which the schema forbids, so it always
+    resolved to '' and the tuning script was never sourced.
+    """
+    return skypilot_config.get_nested(
+        ('lsf', 'cluster_configs', cluster, 'nccl_tuning_file'), '')
+
+
+def get_enroot_mounts(cluster: str) -> List[str]:
+    """Get the extra enroot bind-mount specs for a cluster, from sky config.
+
+    Each entry is an enroot mounts(5) line, e.g. ``"/gpfs /gpfs"``. These are
+    added to the built-in identity mounts, and any that qualify as shared
+    identity mounts also become file_mount wrap-exemption roots (see
+    _derive_shared_fs_roots in sky/provision/lsf/instance.py).
+    """
+    return skypilot_config.get_nested(
+        ('lsf', 'cluster_configs', cluster, 'enroot_mounts'), [])
 
 
 def get_bsub_options(cluster: str,

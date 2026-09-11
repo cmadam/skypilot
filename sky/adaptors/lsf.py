@@ -61,6 +61,38 @@ class NodeInfo(NamedTuple):
     gpu_model: str
 
 
+def parse_exec_host_field(exec_host_str: str) -> List[str]:
+    """Parse an LSF EXEC_HOST value into an ordered list of unique hosts.
+
+    LSF reports one entry per allocated *slot*, either repeated
+    (``host1:host1:host2``) or run-length encoded (``2*host1:2*host2``), and the
+    two forms can be mixed in one value.
+
+    Order is preserved and duplicates dropped. Order is load-bearing, not
+    cosmetic: the first host is rank 0, and the bsub script derives the same
+    ordering independently from ``$LSB_HOSTS``, so sorting here would silently
+    disagree with the job's own view of which node is the master.
+
+    Args:
+        exec_host_str: the raw EXEC_HOST field value.
+
+    Returns:
+        Unique hostnames in the order LSF listed them.
+    """
+    unique_hosts: List[str] = []
+    seen = set()
+    for part in exec_host_str.split(':'):
+        part = part.strip()
+        if not part:
+            continue
+        # "N*hostname" -> "hostname"
+        hostname = part.split('*', 1)[1] if '*' in part else part
+        if hostname not in seen:
+            seen.add(hostname)
+            unique_hosts.append(hostname)
+    return unique_hosts
+
+
 class LsfClient:
     """Client for IBM Spectrum LSF control plane operations."""
 
@@ -484,7 +516,13 @@ class LsfClient:
         return gpu_info
 
     def check_job_has_nodes(self, job_id: str) -> bool:
-        """Check if an LSF job has hosts allocated."""
+        """Check if an LSF job has hosts allocated.
+
+        Left on the tabular form deliberately: this only asks whether the field
+        is non-empty, and width truncation cannot turn a populated EXEC_HOST
+        into an empty one. get_job_nodes(), which needs the whole list, uses
+        JSON instead.
+        """
         cmd = f'bjobs -noheader -o "EXEC_HOST" {job_id}'
         rc, stdout, stderr = self._run_lsf_cmd(cmd)
         if rc != 0:
@@ -504,7 +542,17 @@ class LsfClient:
             A tuple of (nodes, node_ips) where nodes is a list of unique
             hostnames and node_ips is a list of corresponding IP addresses.
         """
-        cmd = f'bjobs -noheader -o "EXEC_HOST" {job_id}'
+        # Queried as JSON rather than `-noheader -o "EXEC_HOST"`: the tabular
+        # form truncates each field to its width, and EXEC_HOST is the one field
+        # here whose length grows with the job. It holds one entry per allocated
+        # slot, so a 4-node job at 8 slots/node is already ~400 characters and a
+        # large job runs to kilobytes. Truncation carries no marker — the value
+        # simply ends early — so the failure is a short host list that looks
+        # entirely valid, and the driver would provision and dispatch to a
+        # subset of the allocation. JSON output is not width-limited, and
+        # specifying a wide `-o` field instead would pad every reply to that
+        # width. get_job_info() already depends on `-json` in this file.
+        cmd = f'bjobs -json -o "exec_host" {job_id}'
         rc, stdout, stderr = self._run_lsf_cmd(cmd)
         subprocess_utils.handle_returncode(
             rc,
@@ -513,29 +561,21 @@ class LsfClient:
             stderr=f'{stdout}\n{stderr}',
             stream_logs=False)
 
+        try:
+            records = json.loads(stdout).get('RECORDS', [])
+        except (json.JSONDecodeError, AttributeError) as e:
+            raise RuntimeError(
+                f'Failed to parse bjobs JSON output for job {job_id}: '
+                f'{stdout}') from e
+
         # LSF EXEC_HOST format: "host1:host1:host2:host2" or
         # "N*host1:M*host2" for multi-slot
-        exec_host_str = stdout.strip()
+        exec_host_str = (records[0].get('EXEC_HOST', '')
+                         if records else '').strip()
         if not exec_host_str or exec_host_str == '-':
-            raise RuntimeError(
-                f'No hosts allocated for job {job_id}.')
+            raise RuntimeError(f'No hosts allocated for job {job_id}.')
 
-        # Parse unique hostnames from the exec_host string
-        # Format can be: "host1:host1:host2" or "2*host1:2*host2"
-        unique_hosts = []
-        seen = set()
-        for part in exec_host_str.split(':'):
-            part = part.strip()
-            if not part:
-                continue
-            # Handle "N*hostname" format
-            if '*' in part:
-                _, hostname = part.split('*', 1)
-            else:
-                hostname = part
-            if hostname not in seen:
-                seen.add(hostname)
-                unique_hosts.append(hostname)
+        unique_hosts = parse_exec_host_field(exec_host_str)
 
         if not unique_hosts:
             raise RuntimeError(

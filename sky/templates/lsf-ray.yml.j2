@@ -31,6 +31,8 @@ provider:
   # Resource configuration passed to provisioner
   cpus: "{{cpus}}"
   memory: "{{memory}}"
+  memory_explicit: "{{memory_explicit}}"
+  cpus_explicit: "{{cpus_explicit}}"
   accelerator_type: "{{accelerator_type}}"
   accelerator_count: "{{accelerator_count}}"
 {% if image_id %}
@@ -48,6 +50,14 @@ provider:
   enroot_squash_options: "{{enroot_squash_options}}"
 {% if nccl_tuning_file %}
   nccl_tuning_file: "{{nccl_tuning_file}}"
+{% endif %}
+{% if enroot_mounts %}
+  # Extra bind mounts, added to the built-in identity mounts. Those that are
+  # shared identity mounts also become file_mount wrap-exemption roots.
+  enroot_mounts:
+{% for mount in enroot_mounts %}
+    - "{{mount}}"
+{% endfor %}
 {% endif %}
 
   # Working directories

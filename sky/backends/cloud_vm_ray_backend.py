@@ -6631,23 +6631,44 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 container_name,
             )
         elif isinstance(handle.launched_resources.cloud, clouds.LSF):
-            dispatch_dir = None
-            container_image = (
-                list(handle.launched_resources.image_id.values())[0]
-                if handle.launched_resources.image_id else None)
-            if container_image is not None:
-                assert (handle.cached_cluster_info
-                        is not None), ('cached_cluster_info must be set')
-                provider_config = (
-                    handle.cached_cluster_info.provider_config)
+            dispatch_root = None
+            topology_dir = None
+            nodes = []
+            node_ips = []
+            # Not gated on a container image: a bare-metal job now runs a
+            # dispatcher on each host too, so it dispatches to the allocation
+            # rather than executing on the login node. The dispatcher lives
+            # inside enroot when containerized and on the host otherwise; the
+            # driver writes to the same per-host directories either way.
+            if handle.cached_cluster_info is not None:
+                cluster_info = handle.cached_cluster_info
+                provider_config = cluster_info.provider_config
                 workdir = provider_config.get('workdir', '')
                 if not workdir:
                     workdir = '~/sky_workdir'
-                dispatch_dir = (f'{workdir}/'
-                                f'{handle.cluster_name_on_cloud}/'
-                                f'.sky/dispatch')
+                sky_cluster_home = (f'{workdir}/'
+                                    f'{handle.cluster_name_on_cloud}')
+                # dispatch_root holds one dispatch directory per host, named by
+                # short hostname; topology_dir holds the rank manifest the job
+                # publishes. Both are written by the bsub script.
+                dispatch_root = f'{sky_cluster_home}/.sky/dispatch'
+                topology_dir = f'{sky_cluster_home}/.sky/topology'
+                # The 'node' tag is the allocated hostname. Its order here is
+                # not used as rank — the executor reads rank from the job's
+                # manifest — but it is what pairs a host with its IP.
+                for instances in cluster_info.instances.values():
+                    for instance in instances:
+                        node = (instance.tags or {}).get('node')
+                        if node is None:
+                            continue
+                        nodes.append(node)
+                        node_ips.append(instance.internal_ip or '')
             return task_codegen.LsfCodeGen(
-                container_dispatch_dir=dispatch_dir)
+                dispatch_root=dispatch_root,
+                topology_dir=topology_dir,
+                nodes=nodes,
+                node_ips=node_ips,
+            )
         else:
             return task_codegen.RayCodeGen()
 
