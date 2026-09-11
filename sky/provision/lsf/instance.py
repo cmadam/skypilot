@@ -245,6 +245,52 @@ def _build_dispatcher_block(dispatch_root: str) -> str:
     """)
 
 
+def _build_baremetal_exec_block(shared_dir: str, dispatch_root: str,
+                                is_multinode: bool) -> str:
+    """Build the execution block for a job with no container.
+
+    Containerized jobs get their fan-out and dispatcher from
+    ``_build_enroot_block``. Without a container there was nothing at all: the
+    script computed topology, signalled ready, and slept on the first host, so a
+    multi-node bare-metal allocation left every other node idle while the task
+    ran on the login node instead.
+
+    This emits the two pieces the container path relies on — ``blaunch`` to re-run
+    the script on every host, and a per-host dispatcher to execute what the driver
+    writes — without enroot.
+
+    Args:
+        shared_dir: directory on the shared filesystem for the blaunch worker
+            script copy. The container path uses the enroot share_path; there is
+            no enroot config here, so the caller passes the cluster home.
+        dispatch_root: parent of the per-host dispatch directories.
+        is_multinode: whether to fan out at all.
+
+    Returns:
+        The shell block; the dispatcher alone when single-node.
+    """
+    return f"""\
+# === Bare-metal execution (no container) ===
+{_build_blaunch_dispatch(shared_dir, is_multinode)}
+{_build_dispatcher_block(dispatch_root)}
+echo "[$(date)] Starting command dispatcher on $(hostname -s)"
+bash "$DISPATCH_DIR/dispatcher.sh" "$DISPATCH_DIR" &
+DISPATCH_PID=$!
+
+echo "[$(date)] Waiting for dispatcher to be ready..."
+READY_WAIT=0
+while [ ! -f "$DISPATCH_DIR/.ready" ]; do
+    sleep 0.5
+    READY_WAIT=$((READY_WAIT + 1))
+    if [ $READY_WAIT -gt 120 ]; then
+        echo "ERROR: dispatcher did not become ready in 60s"
+        exit 1
+    fi
+done
+echo "[$(date)] Dispatcher ready (PID=$DISPATCH_PID), dispatch_dir=$DISPATCH_DIR"
+"""
+
+
 def _build_topology_block(num_nodes: int, sky_cluster_home: str) -> str:
     """Build the topology block: rank, world size, master address and port.
 
@@ -745,6 +791,17 @@ def _build_bsub_script(
             inject_topology=True,
         )
 
+    if not container_block:
+        # No container: fan out and run a dispatcher on each host, so the task
+        # executes on the allocated nodes rather than the login node. The cluster
+        # home stands in for the enroot share_path as the shared location for the
+        # blaunch worker-script copy.
+        container_block = _build_baremetal_exec_block(
+            shared_dir=sky_cluster_home,
+            dispatch_root=dispatch_root,
+            is_multinode=(num_nodes > 1),
+        )
+
     # Topology is computed for every job, not just containerized ones: a
     # bare-metal multi-node job needs the same rank/master values, and the rank
     # manifest it publishes is what the driver reads to map host -> rank.
@@ -823,12 +880,13 @@ if [[ "${{RANK:-0}}" == "0" ]]; then
 fi
 echo "SkyPilot LSF instance ready: {cluster_name_on_cloud} (node $(hostname -s), rank ${{RANK:-0}})"
 
-# Keep job alive until terminated
+# Keep job alive until terminated. Both modes run a dispatcher in the background
+# and wait on it; the sleep is a fallback for a job that has neither.
 if [[ -n "${{ENROOT_PID:-}}" ]]; then
-    # Container mode: wait for dispatcher to exit (or be killed)
     wait $ENROOT_PID
+elif [[ -n "${{DISPATCH_PID:-}}" ]]; then
+    wait $DISPATCH_PID
 else
-    # Bare-metal mode: sleep forever
     sleep infinity
 fi
 """

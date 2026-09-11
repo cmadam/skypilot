@@ -294,11 +294,12 @@ if [[ "${RANK:-0}" == "0" ]]; then
 fi
 echo "SkyPilot LSF instance ready: sky-gold-kd-abc123 (node $(hostname -s), rank ${RANK:-0})"
 
-# Keep job alive until terminated
+# Keep job alive until terminated. Both modes run a dispatcher in the background
+# and wait on it; the sleep is a fallback for a job that has neither.
 if [[ -n "${ENROOT_PID:-}" ]]; then
-    # Container mode: wait for dispatcher to exit (or be killed)
     wait $ENROOT_PID
+elif [[ -n "${DISPATCH_PID:-}" ]]; then
+    wait $DISPATCH_PID
 else
-    # Bare-metal mode: sleep forever
     sleep infinity
 fi

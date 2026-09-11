@@ -447,12 +447,14 @@ def test_lsf_multi_node_2nodes():
 
 
 def test_lsf_multi_node_bare_metal():
-    """Two-node LSF job with no container (no dispatch dir).
+    """Two-node LSF job with no dispatch_root at all — the login-node fallback.
 
-    The non-dispatch branch runs the user's script via run_bash_command_with_log
-    on the login node. Frozen separately because making bare-metal multi-node
-    execute on the compute nodes is a deliberate behavior change (A6), and this
-    is the golden that must move when it lands.
+    This is no longer what a bare-metal cluster produces: the provisioner now runs
+    a dispatcher on every host without enroot, and the backend supplies
+    dispatch_root regardless of container image, so bare-metal dispatches to the
+    allocation (see test_lsf_bare_metal_with_dispatch_uses_the_executor). What
+    remains on this path is a cluster provisioned before that existed, where
+    executing on the login node is the only option left.
     """
     codegen = task_codegen.LsfCodeGen()
     codegen.add_prologue(job_id=2)
@@ -538,3 +540,46 @@ def test_lsf_multi_node_delegates_per_node_env_to_the_executor():
     # Setup no longer writes to a fixed 'setup' sequence name, which N nodes
     # would have contended for.
     assert "seq = 'setup'" not in code
+
+
+def test_lsf_bare_metal_with_dispatch_uses_the_executor():
+    """A bare-metal cluster dispatches to its nodes, same as a containerized one.
+
+    Before this, the fan-out and dispatcher were emitted only inside the enroot
+    block, so a bare-metal multi-node allocation ran the task once on the login
+    node and left every allocated host idle. The codegen difference is that
+    dispatch_root is now populated whether or not there is a container image.
+    """
+    codegen = task_codegen.LsfCodeGen(
+        dispatch_root='/proj/builds/cluster/.sky/dispatch',
+        topology_dir='/proj/builds/cluster/.sky/topology',
+        nodes=['host1', 'host2'],
+        node_ips=['10.0.0.1', '10.0.0.2'],
+    )
+    codegen.add_prologue(job_id=2)
+    codegen.add_setup(
+        2,
+        resources_dict={'CPU': 4.0},
+        stable_cluster_internal_ips=['10.0.0.1', '10.0.0.2'],
+        env_vars={},
+        log_dir='/sky/logs',
+        setup_cmd=None,
+    )
+    codegen.add_task(
+        2,
+        bash_script='hostname',
+        task_name='probe',
+        resources_dict={'CPU': 4.0},
+        log_dir='/sky/logs/tasks',
+        env_vars={},
+    )
+    codegen.add_epilogue()
+    code = codegen.build()
+
+    assert 'lsf_executor.run_on_all_nodes(' in code
+    assert "nodes=['host1', 'host2']" in code
+    # The login-node path must not be taken when the nodes are reachable. Assert
+    # on the CALL, not the name: the helper's definition is inlined into every
+    # prologue whether or not this branch uses it.
+    assert 'result = run_bash_command_with_log_and_return_pid(' not in code
+    assert "sky_env_vars_dict['SKYPILOT_NODE_RANK'] = 0" not in code

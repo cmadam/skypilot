@@ -744,3 +744,59 @@ class TestExplicitResourcesOutrankBsubOptions:
         config['bsub_options'] = {'M': '64G'}
         mem = [d for d in self._directives(config) if d.startswith('#BSUB -M')]
         assert mem == ['#BSUB -M 64G'], mem
+
+
+class TestBareMetalExecution:
+    """A job with no container must still run on its allocated nodes.
+
+    The fan-out and the dispatcher used to be emitted only inside the enroot
+    block, so a bare-metal allocation computed topology, signalled ready, and slept
+    on the first host — the task ran on the login node and every other allocated
+    node sat idle for the duration.
+    """
+
+    def _script(self, num_nodes=2, cpus='4'):
+        config = _base_provider_config()
+        config['cpus'] = cpus
+        return lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                               config,
+                                               num_nodes=num_nodes)
+
+    def test_dispatcher_runs_without_a_container(self):
+        script = self._script()
+        assert '=== Bare-metal execution (no container) ===' in script
+        assert 'bash "$DISPATCH_DIR/dispatcher.sh" "$DISPATCH_DIR" &' in script
+
+    def test_dispatch_dir_is_still_per_host(self):
+        assert '/.sky/dispatch/$(hostname -s)"' in self._script()
+
+    def test_multinode_fans_out_with_blaunch(self):
+        assert 'blaunch -z "${UNIQUE_HOSTS[*]}"' in self._script(num_nodes=2)
+
+    def test_single_node_needs_no_fan_out(self):
+        script = self._script(num_nodes=1, cpus='1')
+        assert 'blaunch' not in script
+        assert 'dispatcher.sh' in script, 'but still needs a dispatcher'
+
+    def test_job_waits_on_the_dispatcher_not_sleep(self):
+        """`sleep infinity` kept the allocation alive without doing anything; the
+        job should live exactly as long as its dispatcher."""
+        script = self._script()
+        assert 'wait $DISPATCH_PID' in script
+        assert script.index('elif [[ -n "${DISPATCH_PID:-}" ]]') < script.index(
+            'sleep infinity')
+
+    def test_worker_script_is_copied_to_a_shared_path(self):
+        """There is no enroot share_path here, so the cluster home stands in — it
+        has to be on the shared filesystem for blaunch to find it."""
+        script = self._script(num_nodes=2)
+        assert f'/skypilot/{CLUSTER_NAME}/tmp/sky-worker-$LSB_JOBID.sh' in script
+
+    def test_containerized_jobs_are_unaffected(self):
+        """The enroot path keeps its own dispatcher; only one may run."""
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        assert '=== Bare-metal execution (no container) ===' not in script
+        assert 'enroot start' in script
+        assert script.count('cat > "$DISPATCH_DIR/dispatcher.sh"') == 1

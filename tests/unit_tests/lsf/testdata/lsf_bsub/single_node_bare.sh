@@ -70,6 +70,45 @@ if [[ "$RANK" == "0" ]]; then
 fi
 
 
+# === Bare-metal execution (no container) ===
+
+# ── Step 4: Command dispatcher (per host) ──────────────────────────────
+DISPATCH_DIR="/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky/dispatch/$(hostname -s)"
+rm -rf "$DISPATCH_DIR"
+mkdir -p "$DISPATCH_DIR"
+cat > "$DISPATCH_DIR/dispatcher.sh" << 'DISPATCH_EOF'
+#!/bin/bash
+DDIR="$1"
+touch "$DDIR/.ready"
+while true; do
+    for cmd_file in "$DDIR"/cmd_*.sh; do
+        [ -f "$cmd_file" ] || continue
+        seq="${cmd_file##*/cmd_}"; seq="${seq%.sh}"
+        /bin/bash "$cmd_file" > "$DDIR/out_${seq}.log" 2>&1
+        echo $? > "$DDIR/rc_${seq}"
+        mv "$cmd_file" "$DDIR/done_${seq}.sh"
+    done
+    [ -f "$DDIR/.shutdown" ] && break
+    sleep 0.5
+done
+DISPATCH_EOF
+chmod +x "$DISPATCH_DIR/dispatcher.sh"
+
+echo "[$(date)] Starting command dispatcher on $(hostname -s)"
+bash "$DISPATCH_DIR/dispatcher.sh" "$DISPATCH_DIR" &
+DISPATCH_PID=$!
+
+echo "[$(date)] Waiting for dispatcher to be ready..."
+READY_WAIT=0
+while [ ! -f "$DISPATCH_DIR/.ready" ]; do
+    sleep 0.5
+    READY_WAIT=$((READY_WAIT + 1))
+    if [ $READY_WAIT -gt 120 ]; then
+        echo "ERROR: dispatcher did not become ready in 60s"
+        exit 1
+    fi
+done
+echo "[$(date)] Dispatcher ready (PID=$DISPATCH_PID), dispatch_dir=$DISPATCH_DIR"
 
 
 # Signal ready: this node always, plus the legacy shared path from
@@ -80,11 +119,12 @@ if [[ "${RANK:-0}" == "0" ]]; then
 fi
 echo "SkyPilot LSF instance ready: sky-gold-kd-abc123 (node $(hostname -s), rank ${RANK:-0})"
 
-# Keep job alive until terminated
+# Keep job alive until terminated. Both modes run a dispatcher in the background
+# and wait on it; the sleep is a fallback for a job that has neither.
 if [[ -n "${ENROOT_PID:-}" ]]; then
-    # Container mode: wait for dispatcher to exit (or be killed)
     wait $ENROOT_PID
+elif [[ -n "${DISPATCH_PID:-}" ]]; then
+    wait $DISPATCH_PID
 else
-    # Bare-metal mode: sleep forever
     sleep infinity
 fi

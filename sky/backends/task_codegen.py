@@ -1071,10 +1071,12 @@ class SlurmCodeGen(TaskCodeGen):
 class LsfCodeGen(TaskCodeGen):
     """Code generator for task execution on LSF.
 
-    When dispatch_root is set, user commands are dispatched to the container
-    running on each compute node over the shared filesystem: write cmd_<seq>.sh
-    into that node's dispatch directory, its dispatcher executes it, then poll
-    rc_<seq> for the result.
+    When dispatch_root is set, user commands are dispatched to each compute node
+    over the shared filesystem: write cmd_<seq>.sh into that node's dispatch
+    directory, its dispatcher executes it, then poll rc_<seq> for the result. The
+    dispatcher runs inside the enroot container for a containerized job and
+    directly on the host otherwise, so both cases execute where the allocation
+    is; only a cluster with no dispatch_root at all falls back to the login node.
 
     The fan-out across nodes is delegated to sky.skylet.executor.lsf, which runs
     driver-side (see that module's docstring for why it cannot run on the compute
@@ -1260,9 +1262,10 @@ class LsfCodeGen(TaskCodeGen):
                 """),
             ]
         else:
-            # No container: the script runs on the login node, as before. Making
-            # this path execute on the compute nodes is a deliberate behavior
-            # change, handled separately.
+            # No container, and no dispatch_root either (an older cluster, or one
+            # provisioned before bare-metal fan-out existed): run on the login
+            # node. Correct only for a single node, and the sole remaining path
+            # that does not execute where the allocation is.
             self._code += preamble + [
                 textwrap.dedent(f"""\
                 script = {task_bash_script!r}

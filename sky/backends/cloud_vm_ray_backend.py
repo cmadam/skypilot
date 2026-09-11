@@ -6635,12 +6635,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             topology_dir = None
             nodes = []
             node_ips = []
-            container_image = (
-                list(handle.launched_resources.image_id.values())[0]
-                if handle.launched_resources.image_id else None)
-            if container_image is not None:
-                assert (handle.cached_cluster_info
-                        is not None), ('cached_cluster_info must be set')
+            # Not gated on a container image: a bare-metal job now runs a
+            # dispatcher on each host too, so it dispatches to the allocation
+            # rather than executing on the login node. The dispatcher lives
+            # inside enroot when containerized and on the host otherwise; the
+            # driver writes to the same per-host directories either way.
+            if handle.cached_cluster_info is not None:
                 cluster_info = handle.cached_cluster_info
                 provider_config = cluster_info.provider_config
                 workdir = provider_config.get('workdir', '')
