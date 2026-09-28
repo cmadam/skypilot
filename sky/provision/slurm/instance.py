@@ -1149,6 +1149,13 @@ def get_command_runners(
     container_args = _build_pyxis_args(
         cluster_name_on_cloud) if has_container else None
 
+    # File_mount destinations under the configured workdir must not be
+    # symlink-wrapped: the wrap's `sudo mkdir` fails for a sudo-less login user
+    # on a bare-host cluster (see SlurmCommandRunner.get_unwrapped_mount_prefixes).
+    # Only an explicit workdir is exempted; a home-based cluster keeps the wrap.
+    shared_fs_roots = [workdir] if workdir is not None else []
+    logger.debug(f'Slurm file_mount wrap-exemption roots: {shared_fs_roots}')
+
     runners = [
         # Note: For Slurm, the external IP for all instances is the same,
         # it is the login node's. The internal IP is the private IP of the node.
@@ -1165,6 +1172,7 @@ def get_command_runners(
             ssh_proxy_command=login_node_ssh_proxy_command,
             ssh_control_name=ssh_control_name,
             container_args=container_args,
+            shared_fs_roots=shared_fs_roots,
             enable_interactive_auth=True,
             # Allow ssh-agent and default key fallback for Slurm.
             disable_identities_only=True) for instance_info in instances
