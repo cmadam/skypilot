@@ -6245,8 +6245,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # Destinations under a runner-declared shared-FS root must be left
         # un-wrapped (see CommandRunner.get_unwrapped_mount_prefixes). Consult
         # runners[0] only: the set is homogeneous per cluster, so prefixes from
-        # other runners would be ignored — fine for LSF (the only override)
-        # today; the base returns [] so behavior elsewhere is unchanged.
+        # other runners would be ignored — fine for LSF and Slurm (the only
+        # overrides) today; the base returns [] so behavior elsewhere is
+        # unchanged.
         unwrapped_prefixes: List[str] = []
         if runners:
             unwrapped_prefixes = runners[0].get_unwrapped_mount_prefixes()

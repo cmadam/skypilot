@@ -419,8 +419,12 @@ class SlurmCommandRunner(SSHCommandRunner):
         job_id: str,
         slurm_node: str,
         container_args: Optional[str] = ...,
+        shared_fs_roots: Optional[List[str]] = ...,
         **kwargs,
     ) -> None:
+        ...
+
+    def get_unwrapped_mount_prefixes(self) -> List[str]:
         ...
 
 
