@@ -17,6 +17,7 @@ import difflib
 import os
 from pathlib import Path
 import subprocess
+import time
 from typing import Any, Dict
 
 import pytest
@@ -330,12 +331,18 @@ class TestReadySignals:
 class _StubRunner:
     """Records `test -f` probes and answers from a set of existing paths."""
 
-    def __init__(self, existing):
+    def __init__(self, existing, files=None):
         self.existing = set(existing)
+        self.files = files or {}
         self.commands = []
 
     def run(self, cmd, **kwargs):
         self.commands.append(cmd)
+        if cmd.startswith('tail '):
+            path = cmd.split()[-1].strip("'")
+            if path in self.files:
+                return 0, self.files[path] + '\n', ''
+            return 1, '', f'tail: cannot open {path}'
         # The waiter ANDs one `test -f <path>` per expected node.
         paths = [
             part.split('test -f ')[1].strip().strip("'")
@@ -344,6 +351,17 @@ class _StubRunner:
         ]
         rc = 0 if paths and all(p in self.existing for p in paths) else 1
         return rc, '', ''
+
+
+class _StubClient:
+    """Answers get_job_state with a fixed state."""
+
+    def __init__(self, state):
+        self.state = state
+
+    def get_job_state(self, job_id):
+        del job_id
+        return self.state
 
 
 class TestWaitForAllReadySignals:
@@ -381,6 +399,69 @@ class TestWaitForAllReadySignals:
                                                      'cluster',
                                                      ['host1', 'host2'],
                                                      timeout=1)
+
+    def test_a_job_that_ended_fails_the_wait_at_once(self):
+        """bjobs reported RUN for job 1965794 four seconds after it exited, and
+        the driver then waited out the full 3600s ready_timeout."""
+        runner = _StubRunner([],
+                             files={
+                                 '/logs/1.err': 'mkdir: cannot create '
+                                                "directory '/opt/nvme'"
+                             })
+        start = time.time()
+        with pytest.raises(RuntimeError) as exc:
+            lsf_instance._wait_for_all_ready_signals(runner,
+                                                     self.READY,
+                                                     'cluster', ['host1'],
+                                                     timeout=600,
+                                                     client=_StubClient('EXIT'),
+                                                     job_id='1',
+                                                     err_file='/logs/1.err')
+        assert time.time() - start < 5
+        assert 'state EXIT' in str(exc.value)
+        # The job's own error, which otherwise lives only on the cluster.
+        assert "cannot create directory '/opt/nvme'" in str(exc.value)
+
+    def test_a_job_lsf_has_forgotten_counts_as_ended(self):
+        runner = _StubRunner([])
+        with pytest.raises(RuntimeError, match='not found'):
+            lsf_instance._wait_for_all_ready_signals(runner,
+                                                     self.READY,
+                                                     'cluster', ['host1'],
+                                                     timeout=600,
+                                                     client=_StubClient(None),
+                                                     job_id='1')
+
+    def test_a_running_job_keeps_waiting_until_the_timeout(self):
+        runner = _StubRunner([])
+        with pytest.raises(TimeoutError):
+            lsf_instance._wait_for_all_ready_signals(runner,
+                                                     self.READY,
+                                                     'cluster', ['host1'],
+                                                     timeout=1,
+                                                     client=_StubClient('RUN'),
+                                                     job_id='1')
+
+    def test_signals_win_over_a_job_that_has_since_ended(self):
+        """Signalled, then finished between two polls: that is a ready node."""
+        runner = _StubRunner([f'{self.READY}.host1'])
+        lsf_instance._wait_for_all_ready_signals(runner,
+                                                 self.READY,
+                                                 'cluster', ['host1'],
+                                                 timeout=5,
+                                                 client=_StubClient('DONE'),
+                                                 job_id='1')
+
+    def test_missing_stderr_does_not_mask_the_failure(self):
+        runner = _StubRunner([])
+        with pytest.raises(RuntimeError, match='empty or not yet written'):
+            lsf_instance._wait_for_all_ready_signals(runner,
+                                                     self.READY,
+                                                     'cluster', ['host1'],
+                                                     timeout=600,
+                                                     client=_StubClient('EXIT'),
+                                                     job_id='1',
+                                                     err_file='/logs/none.err')
 
     def test_fqdn_from_lsf_matches_short_name_written_by_the_job(self):
         """LSF may report p1-r08-n4.bluevela.example.com; the job writes the

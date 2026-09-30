@@ -1070,8 +1070,15 @@ def run_instances(
     if image_id and enroot_enabled:
         ready_timeout = _get_timeout(provider_config, 'ready_timeout',
                                      lsf_utils.DEFAULT_READY_TIMEOUT)
-        _wait_for_all_ready_signals(runner, ready_file, cluster_name_on_cloud,
-                                    nodes, ready_timeout)
+        _wait_for_all_ready_signals(
+            runner,
+            ready_file,
+            cluster_name_on_cloud,
+            nodes,
+            ready_timeout,
+            client=client,
+            job_id=job_id,
+            err_file=f'{sky_cluster_home}/sky_logs/{job_id}.err')
 
     return common.ProvisionRecord(
         provider_name='lsf',
@@ -1147,7 +1154,10 @@ def _wait_for_all_ready_signals(
         ready_file: str,
         cluster_name: str,
         nodes: List[str],
-        timeout: int = lsf_utils.DEFAULT_READY_TIMEOUT) -> None:
+        timeout: int = lsf_utils.DEFAULT_READY_TIMEOUT,
+        client: Optional[lsf_adaptor.LsfClient] = None,
+        job_id: Optional[str] = None,
+        err_file: Optional[str] = None) -> None:
     """Wait until every allocated node has signalled readiness.
 
     Each node touches ``<ready_file>.<short hostname>``; this waits for all of
@@ -1161,6 +1171,15 @@ def _wait_for_all_ready_signals(
 
     A negative timeout waits indefinitely. This window covers ``enroot import``,
     which is slow on a cold cache.
+
+    Given ``client`` and ``job_id``, a job that ENDS before every node has
+    signalled fails the wait at once instead of after ``timeout``. bjobs can
+    report RUN for a job that has already exited, so _wait_for_job_nodes can
+    hand over a job that died two seconds in; without this check the driver
+    then sat out the whole ready_timeout (3600s on BlueVela) waiting for a
+    signal that could no longer come, and the retry that would have moved it
+    to another host waited with it. ``err_file`` is the job's LSF stderr, whose
+    tail is the only place the job's own error message exists.
     """
     short_names = [n.split('.')[0] for n in nodes]
     expected = [f'{ready_file}.{n}' for n in short_names]
@@ -1176,6 +1195,15 @@ def _wait_for_all_ready_signals(
         if rc == 0:
             logger.info(f'All {len(expected)} node(s) ready for {cluster_name}')
             return
+        # Checked AFTER the signals, so a job that signalled and then ended
+        # between two polls still counts as ready.
+        if client is not None and job_id is not None:
+            state = client.get_job_state(job_id)
+            if state is None or state in lsf_adaptor.LSF_TERMINAL_STATES:
+                raise RuntimeError(
+                    f'LSF job {job_id} for {cluster_name} ended (state '
+                    f'{state or "not found"}) before every node signalled '
+                    f'readiness.' + _job_stderr_tail(runner, err_file))
         time.sleep(_POLL_INTERVAL)
 
     # Name the outstanding nodes: with a multi-node job the useful question is
@@ -1194,6 +1222,26 @@ def _wait_for_all_ready_signals(
     raise TimeoutError(
         f'Timed out waiting for container readiness for {cluster_name} '
         f'after {timeout}s. {detail}')
+
+
+def _job_stderr_tail(runner, err_file: Optional[str], lines: int = 20) -> str:
+    """The tail of a job's LSF stderr, formatted for an exception message.
+
+    Best effort: the file may not exist yet, or be unreadable, and neither may
+    mask the error it is attached to.
+    """
+    if not err_file:
+        return ''
+    try:
+        rc, out, _ = runner.run(f'tail -n {lines} {shlex.quote(err_file)}',
+                                require_outputs=True,
+                                separate_stderr=True,
+                                stream_logs=False)
+    except Exception:  # pylint: disable=broad-except
+        return f' Job stderr: {err_file} (unreadable)'
+    if rc != 0 or not out.strip():
+        return f' Job stderr: {err_file} (empty or not yet written)'
+    return f' Job stderr ({err_file}):\n{out.rstrip()}'
 
 
 def wait_instances(
