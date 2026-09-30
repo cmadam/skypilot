@@ -357,6 +357,53 @@ def _convert_to_enroot_uri(image_id: str) -> str:
     return image_id
 
 
+# Node-local NVMe scratch, and where node-local scratch goes on a host
+# without it.
+#
+# /opt/nvme exists on the BlueVela GPU nodes but not on every host a job can
+# land on: p5-r02-n1, a CPU-only node, has none, and LSF packs 1-CPU jobs onto
+# it. The script runs under `set -e`, so one `mkdir -p /opt/nvme/$USER/...`
+# there exits the job about two seconds in, before the ready signal -- which
+# the driver reports only as "terminated with state EXIT before nodes were
+# allocated", and which repeats on every resubmission because the scheduler
+# keeps choosing that host.
+_NVME_ROOT = '/opt/nvme'
+_NODE_LOCAL_FALLBACK_ROOT = '/tmp'
+
+
+def _build_node_local_scratch_block(tmpdir: str) -> str:
+    """Probe for writable NVMe on THIS host and create the task tmpdir.
+
+    Sets SKY_NVME_OK=1 when ``/opt/nvme/$USER`` can be created and written, else
+    0, and creates ``$SKY_TMPDIR``: the configured tmpdir, with a leading
+    ``/opt/nvme`` swapped for ``/tmp`` when the probe failed. The enroot block
+    reads SKY_NVME_OK to choose its data and flatten paths.
+
+    Deliberately NOT exported. A multi-node master exports BV_WORKER before
+    blaunch re-runs this script on each worker, and an exported probe result
+    would reach the workers the same way -- so a worker would take the master's
+    answer about a disk that is local to a different host.
+    """
+    return f"""\
+# ── Node-local scratch ────────────────────────────────────────────────
+# Probed per host and not exported: see _build_node_local_scratch_block.
+SKY_NVME_OK=0
+if mkdir -p "{_NVME_ROOT}/$USER" 2>/dev/null && [[ -w "{_NVME_ROOT}/$USER" ]]; then
+    SKY_NVME_OK=1
+else
+    echo "[$(date)] WARNING: {_NVME_ROOT} is not writable on" \\
+         "$(hostname -s); node-local scratch falls back to" \\
+         "{_NODE_LOCAL_FALLBACK_ROOT}"
+fi
+SKY_TMPDIR="{tmpdir}"
+if [[ "$SKY_NVME_OK" != "1" ]]; then
+    case "$SKY_TMPDIR" in
+        {_NVME_ROOT}|{_NVME_ROOT}/*) SKY_TMPDIR="{_NODE_LOCAL_FALLBACK_ROOT}${{SKY_TMPDIR#{_NVME_ROOT}}}" ;;
+    esac
+fi
+mkdir -p "$SKY_TMPDIR\""""
+
+
 def _sqsh_name_from_image(image_id: str) -> str:
     """Derive sqsh filename from image name (shared across all jobs using same image).
 
@@ -408,8 +455,21 @@ def _build_enroot_block(image_id: str, container_name: str,
     sqsh_filename = _sqsh_name_from_image(image_id)
     sqsh_file = f'{share_path}/enroot/{sqsh_filename}'
 
-    enroot_data_path = ('/opt/nvme/$USER/enroot-data'
-                        if use_nvme else f'{share_path}/user-$(id -u)/enroot-data')
+    shared_data_path = f'{share_path}/user-$(id -u)/enroot-data'
+    if use_nvme:
+        # Decided on the host, not here: use_local_nvme is a cluster-wide
+        # setting and NVMe is a per-host fact. Without it, fall back to exactly
+        # what use_local_nvme=False does -- the shared path, not /tmp, because
+        # `enroot create` unpacks the whole multi-GB rootfs into this directory
+        # and /tmp can be RAM-backed and charged against the job's -M limit.
+        enroot_data_setup = (
+            'if [[ "${SKY_NVME_OK:-0}" == "1" ]]; then\n'
+            f'    export ENROOT_DATA_PATH="{_NVME_ROOT}/$USER/enroot-data"\n'
+            'else\n'
+            f'    export ENROOT_DATA_PATH="{shared_data_path}"\n'
+            'fi')
+    else:
+        enroot_data_setup = f'export ENROOT_DATA_PATH="{shared_data_path}"'
 
     # Static env lines (written via quoted heredoc — no shell expansion)
     static_env_lines = '    echo "NVIDIA_VISIBLE_DEVICES=all"\n'
@@ -439,7 +499,10 @@ def _build_enroot_block(image_id: str, container_name: str,
     # Build mount lines for enroot config
     mount_lines = '    echo "/proj /proj"\n'
     mount_lines += '    echo "/tmp /tmp"\n'
-    mount_lines += '    echo "/opt/nvme /opt/nvme"\n'
+    # Only where it exists: enroot fails the container start on a missing
+    # source. Tested when enroot calls mounts(), on the host that runs it.
+    mount_lines += (f'    if [ -d {_NVME_ROOT} ]; then '
+                    f'echo "{_NVME_ROOT} {_NVME_ROOT}"; fi\n')
     mount_lines += '    echo "/opt/share /opt/share"\n'
     for m in mounts:
         mount_lines += f'    echo "{m}"\n'
@@ -472,7 +535,7 @@ WRAPPER
 chmod +x "${{BV_WRAPPER_DIR}}/enroot-mksquashovlfs"
 
 # ── Enroot path setup ─────────────────────────────────────────────────
-export ENROOT_DATA_PATH="{enroot_data_path}"
+{enroot_data_setup}
 export ENROOT_CACHE_PATH="{share_path}/user-$(id -u)/enroot-cache"
 export ENROOT_SQUASH_OPTIONS='{squash_options}'
 export ENROOT_MOUNT_HOME=false
@@ -505,8 +568,16 @@ flatten_sqsh_if_needed() {{
     fi
 
     echo "[$(date)] Sqsh has layered OCI structure, flattening..."
-    local work_dir="/opt/nvme/$USER/flatten-work"
-    local local_flat="/opt/nvme/$USER/$(basename "$sqsh_file" .sqsh)-flat.sqsh"
+    # Without NVMe: the mount points go to /tmp (they hold only the overlay's
+    # small upper/work dirs), and the image-sized flat file goes beside its
+    # destination on the shared filesystem rather than into a possibly
+    # RAM-backed /tmp.
+    local work_dir="{_NODE_LOCAL_FALLBACK_ROOT}/user-$(id -u)/flatten-work"
+    local local_flat="$(dirname "$sqsh_file")/.$(basename "$sqsh_file" .sqsh)-flat-$$.sqsh"
+    if [[ "${{SKY_NVME_OK:-0}}" == "1" ]]; then
+        work_dir="{_NVME_ROOT}/$USER/flatten-work"
+        local_flat="{_NVME_ROOT}/$USER/$(basename "$sqsh_file" .sqsh)-flat.sqsh"
+    fi
     rm -rf "$work_dir" "$local_flat"
     mkdir -p "$work_dir"/{{layers,merged,upper,work}}
 
@@ -857,7 +928,8 @@ trap 'exit 0' TERM
 
 # Create directories
 mkdir -p "{sky_cluster_home}/sky_logs" "{sky_cluster_home}/.sky"
-mkdir -p "{tmpdir}"
+
+{_build_node_local_scratch_block(tmpdir)}
 
 # Remove this node's stale ready signal from previous runs. Scoped to
 # this host: a worker must not delete a peer's fresh signal.
@@ -998,8 +1070,15 @@ def run_instances(
     if image_id and enroot_enabled:
         ready_timeout = _get_timeout(provider_config, 'ready_timeout',
                                      lsf_utils.DEFAULT_READY_TIMEOUT)
-        _wait_for_all_ready_signals(runner, ready_file, cluster_name_on_cloud,
-                                    nodes, ready_timeout)
+        _wait_for_all_ready_signals(
+            runner,
+            ready_file,
+            cluster_name_on_cloud,
+            nodes,
+            ready_timeout,
+            client=client,
+            job_id=job_id,
+            err_file=f'{sky_cluster_home}/sky_logs/{job_id}.err')
 
     return common.ProvisionRecord(
         provider_name='lsf',
@@ -1075,7 +1154,10 @@ def _wait_for_all_ready_signals(
         ready_file: str,
         cluster_name: str,
         nodes: List[str],
-        timeout: int = lsf_utils.DEFAULT_READY_TIMEOUT) -> None:
+        timeout: int = lsf_utils.DEFAULT_READY_TIMEOUT,
+        client: Optional[lsf_adaptor.LsfClient] = None,
+        job_id: Optional[str] = None,
+        err_file: Optional[str] = None) -> None:
     """Wait until every allocated node has signalled readiness.
 
     Each node touches ``<ready_file>.<short hostname>``; this waits for all of
@@ -1089,6 +1171,15 @@ def _wait_for_all_ready_signals(
 
     A negative timeout waits indefinitely. This window covers ``enroot import``,
     which is slow on a cold cache.
+
+    Given ``client`` and ``job_id``, a job that ENDS before every node has
+    signalled fails the wait at once instead of after ``timeout``. bjobs can
+    report RUN for a job that has already exited, so _wait_for_job_nodes can
+    hand over a job that died two seconds in; without this check the driver
+    then sat out the whole ready_timeout (3600s on BlueVela) waiting for a
+    signal that could no longer come, and the retry that would have moved it
+    to another host waited with it. ``err_file`` is the job's LSF stderr, whose
+    tail is the only place the job's own error message exists.
     """
     short_names = [n.split('.')[0] for n in nodes]
     expected = [f'{ready_file}.{n}' for n in short_names]
@@ -1104,6 +1195,15 @@ def _wait_for_all_ready_signals(
         if rc == 0:
             logger.info(f'All {len(expected)} node(s) ready for {cluster_name}')
             return
+        # Checked AFTER the signals, so a job that signalled and then ended
+        # between two polls still counts as ready.
+        if client is not None and job_id is not None:
+            state = client.get_job_state(job_id)
+            if state is None or state in lsf_adaptor.LSF_TERMINAL_STATES:
+                raise RuntimeError(
+                    f'LSF job {job_id} for {cluster_name} ended (state '
+                    f'{state or "not found"}) before every node signalled '
+                    f'readiness.' + _job_stderr_tail(runner, err_file))
         time.sleep(_POLL_INTERVAL)
 
     # Name the outstanding nodes: with a multi-node job the useful question is
@@ -1122,6 +1222,26 @@ def _wait_for_all_ready_signals(
     raise TimeoutError(
         f'Timed out waiting for container readiness for {cluster_name} '
         f'after {timeout}s. {detail}')
+
+
+def _job_stderr_tail(runner, err_file: Optional[str], lines: int = 20) -> str:
+    """The tail of a job's LSF stderr, formatted for an exception message.
+
+    Best effort: the file may not exist yet, or be unreadable, and neither may
+    mask the error it is attached to.
+    """
+    if not err_file:
+        return ''
+    try:
+        rc, out, _ = runner.run(f'tail -n {lines} {shlex.quote(err_file)}',
+                                require_outputs=True,
+                                separate_stderr=True,
+                                stream_logs=False)
+    except Exception:  # pylint: disable=broad-except
+        return f' Job stderr: {err_file} (unreadable)'
+    if rc != 0 or not out.strip():
+        return f' Job stderr: {err_file} (empty or not yet written)'
+    return f' Job stderr ({err_file}):\n{out.rstrip()}'
 
 
 def wait_instances(

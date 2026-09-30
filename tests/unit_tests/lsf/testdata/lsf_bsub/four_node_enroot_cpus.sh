@@ -36,7 +36,24 @@ trap 'exit 0' TERM
 
 # Create directories
 mkdir -p "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/sky_logs" "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky"
-mkdir -p "/opt/nvme/$USER/skypilot-tmp"
+
+# ── Node-local scratch ────────────────────────────────────────────────
+# Probed per host and not exported: see _build_node_local_scratch_block.
+SKY_NVME_OK=0
+if mkdir -p "/opt/nvme/$USER" 2>/dev/null && [[ -w "/opt/nvme/$USER" ]]; then
+    SKY_NVME_OK=1
+else
+    echo "[$(date)] WARNING: /opt/nvme is not writable on" \
+         "$(hostname -s); node-local scratch falls back to" \
+         "/tmp"
+fi
+SKY_TMPDIR="/opt/nvme/$USER/skypilot-tmp"
+if [[ "$SKY_NVME_OK" != "1" ]]; then
+    case "$SKY_TMPDIR" in
+        /opt/nvme|/opt/nvme/*) SKY_TMPDIR="/tmp${SKY_TMPDIR#/opt/nvme}" ;;
+    esac
+fi
+mkdir -p "$SKY_TMPDIR"
 
 # Remove this node's stale ready signal from previous runs. Scoped to
 # this host: a worker must not delete a peer's fresh signal.
@@ -110,7 +127,11 @@ WRAPPER
 chmod +x "${BV_WRAPPER_DIR}/enroot-mksquashovlfs"
 
 # ── Enroot path setup ─────────────────────────────────────────────────
-export ENROOT_DATA_PATH="/opt/nvme/$USER/enroot-data"
+if [[ "${SKY_NVME_OK:-0}" == "1" ]]; then
+    export ENROOT_DATA_PATH="/opt/nvme/$USER/enroot-data"
+else
+    export ENROOT_DATA_PATH="/proj/granite-build/g4os/user-$(id -u)/enroot-data"
+fi
 export ENROOT_CACHE_PATH="/proj/granite-build/g4os/user-$(id -u)/enroot-cache"
 export ENROOT_SQUASH_OPTIONS='-comp lz4 -Xhc -no-xattrs'
 export ENROOT_MOUNT_HOME=false
@@ -143,8 +164,16 @@ flatten_sqsh_if_needed() {
     fi
 
     echo "[$(date)] Sqsh has layered OCI structure, flattening..."
-    local work_dir="/opt/nvme/$USER/flatten-work"
-    local local_flat="/opt/nvme/$USER/$(basename "$sqsh_file" .sqsh)-flat.sqsh"
+    # Without NVMe: the mount points go to /tmp (they hold only the overlay's
+    # small upper/work dirs), and the image-sized flat file goes beside its
+    # destination on the shared filesystem rather than into a possibly
+    # RAM-backed /tmp.
+    local work_dir="/tmp/user-$(id -u)/flatten-work"
+    local local_flat="$(dirname "$sqsh_file")/.$(basename "$sqsh_file" .sqsh)-flat-$$.sqsh"
+    if [[ "${SKY_NVME_OK:-0}" == "1" ]]; then
+        work_dir="/opt/nvme/$USER/flatten-work"
+        local_flat="/opt/nvme/$USER/$(basename "$sqsh_file" .sqsh)-flat.sqsh"
+    fi
     rm -rf "$work_dir" "$local_flat"
     mkdir -p "$work_dir"/{layers,merged,upper,work}
 
@@ -267,7 +296,7 @@ cat >> "$ENROOT_CONFIG_FILE" << ENROOT_CFG_DYNAMIC
 mounts() {
     echo "/proj /proj"
     echo "/tmp /tmp"
-    echo "/opt/nvme /opt/nvme"
+    if [ -d /opt/nvme ]; then echo "/opt/nvme /opt/nvme"; fi
     echo "/opt/share /opt/share"
 }
 ENROOT_CFG_DYNAMIC

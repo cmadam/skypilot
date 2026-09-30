@@ -17,6 +17,7 @@ import difflib
 import os
 from pathlib import Path
 import subprocess
+import time
 from typing import Any, Dict
 
 import pytest
@@ -330,12 +331,18 @@ class TestReadySignals:
 class _StubRunner:
     """Records `test -f` probes and answers from a set of existing paths."""
 
-    def __init__(self, existing):
+    def __init__(self, existing, files=None):
         self.existing = set(existing)
+        self.files = files or {}
         self.commands = []
 
     def run(self, cmd, **kwargs):
         self.commands.append(cmd)
+        if cmd.startswith('tail '):
+            path = cmd.split()[-1].strip("'")
+            if path in self.files:
+                return 0, self.files[path] + '\n', ''
+            return 1, '', f'tail: cannot open {path}'
         # The waiter ANDs one `test -f <path>` per expected node.
         paths = [
             part.split('test -f ')[1].strip().strip("'")
@@ -344,6 +351,17 @@ class _StubRunner:
         ]
         rc = 0 if paths and all(p in self.existing for p in paths) else 1
         return rc, '', ''
+
+
+class _StubClient:
+    """Answers get_job_state with a fixed state."""
+
+    def __init__(self, state):
+        self.state = state
+
+    def get_job_state(self, job_id):
+        del job_id
+        return self.state
 
 
 class TestWaitForAllReadySignals:
@@ -381,6 +399,69 @@ class TestWaitForAllReadySignals:
                                                      'cluster',
                                                      ['host1', 'host2'],
                                                      timeout=1)
+
+    def test_a_job_that_ended_fails_the_wait_at_once(self):
+        """bjobs reported RUN for job 1965794 four seconds after it exited, and
+        the driver then waited out the full 3600s ready_timeout."""
+        runner = _StubRunner([],
+                             files={
+                                 '/logs/1.err': 'mkdir: cannot create '
+                                                "directory '/opt/nvme'"
+                             })
+        start = time.time()
+        with pytest.raises(RuntimeError) as exc:
+            lsf_instance._wait_for_all_ready_signals(runner,
+                                                     self.READY,
+                                                     'cluster', ['host1'],
+                                                     timeout=600,
+                                                     client=_StubClient('EXIT'),
+                                                     job_id='1',
+                                                     err_file='/logs/1.err')
+        assert time.time() - start < 5
+        assert 'state EXIT' in str(exc.value)
+        # The job's own error, which otherwise lives only on the cluster.
+        assert "cannot create directory '/opt/nvme'" in str(exc.value)
+
+    def test_a_job_lsf_has_forgotten_counts_as_ended(self):
+        runner = _StubRunner([])
+        with pytest.raises(RuntimeError, match='not found'):
+            lsf_instance._wait_for_all_ready_signals(runner,
+                                                     self.READY,
+                                                     'cluster', ['host1'],
+                                                     timeout=600,
+                                                     client=_StubClient(None),
+                                                     job_id='1')
+
+    def test_a_running_job_keeps_waiting_until_the_timeout(self):
+        runner = _StubRunner([])
+        with pytest.raises(TimeoutError):
+            lsf_instance._wait_for_all_ready_signals(runner,
+                                                     self.READY,
+                                                     'cluster', ['host1'],
+                                                     timeout=1,
+                                                     client=_StubClient('RUN'),
+                                                     job_id='1')
+
+    def test_signals_win_over_a_job_that_has_since_ended(self):
+        """Signalled, then finished between two polls: that is a ready node."""
+        runner = _StubRunner([f'{self.READY}.host1'])
+        lsf_instance._wait_for_all_ready_signals(runner,
+                                                 self.READY,
+                                                 'cluster', ['host1'],
+                                                 timeout=5,
+                                                 client=_StubClient('DONE'),
+                                                 job_id='1')
+
+    def test_missing_stderr_does_not_mask_the_failure(self):
+        runner = _StubRunner([])
+        with pytest.raises(RuntimeError, match='empty or not yet written'):
+            lsf_instance._wait_for_all_ready_signals(runner,
+                                                     self.READY,
+                                                     'cluster', ['host1'],
+                                                     timeout=600,
+                                                     client=_StubClient('EXIT'),
+                                                     job_id='1',
+                                                     err_file='/logs/none.err')
 
     def test_fqdn_from_lsf_matches_short_name_written_by_the_job(self):
         """LSF may report p1-r08-n4.bluevela.example.com; the job writes the
@@ -800,3 +881,197 @@ class TestBareMetalExecution:
         assert '=== Bare-metal execution (no container) ===' not in script
         assert 'enroot start' in script
         assert script.count('cat > "$DISPATCH_DIR/dispatcher.sh"') == 1
+
+
+def _run_bash(script: str) -> subprocess.CompletedProcess:
+    return subprocess.run(['bash', '-c', script],
+                          capture_output=True,
+                          text=True,
+                          check=False)
+
+
+def _section(script: str, start: str, end: str) -> str:
+    """The text of `script` from the line holding `start` up to `end`."""
+    begin = script.index(start)
+    return script[begin:script.index(end, begin)]
+
+
+class TestNodeLocalScratchFallback:
+    """A host without writable /opt/nvme must still come up.
+
+    p5-r02-n1 is a BlueVela CPU node with no /opt/nvme. With tmpdir under
+    /opt/nvme, the job's `mkdir -p` failed under `set -e` two seconds in, on 8 of
+    8 attempts, and the driver only ever saw "terminated with state EXIT before
+    nodes were allocated". These run the generated shell rather than matching
+    its text, with the NVMe root pointed at a temporary directory.
+    """
+
+    @pytest.fixture
+    def roots(self, tmp_path, monkeypatch):
+        nvme = tmp_path / 'nvme'
+        fallback = tmp_path / 'fallback'
+        fallback.mkdir()
+        monkeypatch.setattr(lsf_instance, '_NVME_ROOT', str(nvme))
+        monkeypatch.setattr(lsf_instance, '_NODE_LOCAL_FALLBACK_ROOT',
+                            str(fallback))
+        return nvme, fallback
+
+    @staticmethod
+    def _probe(tmpdir: str) -> subprocess.CompletedProcess:
+        block = lsf_instance._build_node_local_scratch_block(tmpdir)
+        return _run_bash('set -e\n' + block +
+                         '\necho "RESULT $SKY_NVME_OK $SKY_TMPDIR"')
+
+    @staticmethod
+    def _result(proc: subprocess.CompletedProcess):
+        assert proc.returncode == 0, proc.stderr
+        line = [l for l in proc.stdout.splitlines() if l.startswith('RESULT ')]
+        _, ok, path = line[-1].split(' ', 2)
+        return ok, Path(path)
+
+    def test_writable_nvme_is_used(self, roots):
+        nvme, _ = roots
+        nvme.mkdir()
+        ok, path = self._result(self._probe(f'{nvme}/$USER/skypilot-tmp'))
+        assert ok == '1'
+        assert path == nvme / os.environ['USER'] / 'skypilot-tmp'
+        assert path.is_dir()
+
+    def test_missing_nvme_falls_back_instead_of_exiting(self, roots):
+        nvme, fallback = roots  # nvme's parent exists, nvme itself does not
+        nvme.parent.chmod(0o555)  # ... and cannot be created
+        try:
+            if os.geteuid() == 0:
+                pytest.skip('root ignores directory permissions')
+            proc = self._probe(f'{nvme}/$USER/skypilot-tmp')
+        finally:
+            nvme.parent.chmod(0o755)
+        ok, path = self._result(proc)
+        assert ok == '0'
+        assert path == fallback / os.environ['USER'] / 'skypilot-tmp'
+        assert path.is_dir()
+        assert 'is not writable' in proc.stdout
+
+    def test_unwritable_nvme_falls_back(self, roots):
+        """Present but not writable, which a -p mkdir alone would not catch."""
+        nvme, fallback = roots
+        (nvme / os.environ['USER']).mkdir(parents=True)
+        (nvme / os.environ['USER']).chmod(0o555)
+        try:
+            if os.geteuid() == 0:
+                pytest.skip('root ignores directory permissions')
+            ok, path = self._result(self._probe(f'{nvme}/$USER/skypilot-tmp'))
+        finally:
+            (nvme / os.environ['USER']).chmod(0o755)
+        assert ok == '0'
+        assert path == fallback / os.environ['USER'] / 'skypilot-tmp'
+
+    def test_tmpdir_outside_nvme_is_left_alone(self, roots, tmp_path):
+        nvme, _ = roots
+        # Created before nvme's parent (tmp_path) is made read-only.
+        (tmp_path / 'other').mkdir()
+        elsewhere = tmp_path / 'other' / 'elsewhere'
+        nvme.parent.chmod(0o555)
+        try:
+            if os.geteuid() == 0:
+                pytest.skip('root ignores directory permissions')
+            ok, path = self._result(self._probe(str(elsewhere)))
+        finally:
+            nvme.parent.chmod(0o755)
+        assert ok == '0'
+        assert path == elsewhere
+        assert path.is_dir()
+
+    def test_probe_result_is_not_exported(self):
+        """A blaunch worker would otherwise inherit the master's answer about a
+        disk on a different host."""
+        for num_nodes in (1, 2):
+            script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                     _enroot_provider_config(),
+                                                     num_nodes=num_nodes)
+            assert 'export SKY_NVME_OK' not in script
+            assert 'SKY_NVME_OK=0\n' in script
+
+    def test_probe_runs_before_anything_touches_nvme(self):
+        """Including on blaunch workers, which re-run the script from the top."""
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        probe = script.index('SKY_NVME_OK=0\n')
+        assert probe < script.index('blaunch -z')
+        assert probe < script.index('ENROOT_DATA_PATH')
+
+    def test_no_unconditional_mkdir_under_nvme(self):
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=2)
+        offenders = [
+            line for line in script.splitlines()
+            if 'mkdir' in line and '/opt/nvme' in line and
+            'SKY_NVME_OK' not in line and '&& [[ -w' not in line
+        ]
+        assert not offenders
+
+    @pytest.mark.parametrize('nvme_ok,expect_nvme', [('1', True), ('0', False)])
+    def test_enroot_data_path_follows_the_probe(self, nvme_ok, expect_nvme):
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=1)
+        setup = _section(
+            script, 'if [[ "${SKY_NVME_OK:-0}" == "1" ]]; then\n'
+            '    export ENROOT_DATA_PATH', 'export ENROOT_CACHE_PATH')
+        proc = _run_bash(f'SKY_NVME_OK={nvme_ok}\n{setup}\n'
+                         'echo "$ENROOT_DATA_PATH"')
+        assert proc.returncode == 0, proc.stderr
+        path = proc.stdout.strip()
+        if expect_nvme:
+            assert path == f'/opt/nvme/{os.environ["USER"]}/enroot-data'
+        else:
+            # The use_local_nvme=False path: shared, not a RAM-backed /tmp.
+            assert path.startswith('/proj/granite-build/g4os/user-')
+            assert path.endswith('/enroot-data')
+
+    def test_use_local_nvme_false_never_consults_the_probe(self):
+        config = _enroot_provider_config()
+        config['enroot_use_local_nvme'] = 'False'
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 config,
+                                                 num_nodes=1)
+        assert ('export ENROOT_DATA_PATH='
+                '"/proj/granite-build/g4os/user-$(id -u)/enroot-data"\n'
+                in script)
+        assert '/opt/nvme/$USER/enroot-data' not in script
+
+    @pytest.mark.parametrize('exists', [True, False])
+    def test_nvme_is_mounted_only_where_it_exists(self, roots, exists):
+        nvme, _ = roots
+        if exists:
+            nvme.mkdir()
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=1)
+        mounts = _section(script, 'mounts() {', '\nENROOT_CFG_DYNAMIC')
+        proc = _run_bash(f'{mounts}\nmounts')
+        assert proc.returncode == 0, proc.stderr
+        assert (f'{nvme} {nvme}' in proc.stdout.splitlines()) == exists
+        assert '/proj /proj' in proc.stdout.splitlines()
+
+    @pytest.mark.parametrize('nvme_ok', ['1', '0'])
+    def test_flatten_scratch_follows_the_probe(self, nvme_ok):
+        script = lsf_instance._build_bsub_script(CLUSTER_NAME,
+                                                 _enroot_provider_config(),
+                                                 num_nodes=1)
+        paths = _section(script, '    local work_dir=',
+                         '    rm -rf "$work_dir" "$local_flat"')
+        proc = _run_bash(
+            f'SKY_NVME_OK={nvme_ok}\nf() {{\nsqsh_file=/proj/x/img.sqsh\n'
+            f'{paths}\necho "$work_dir|$local_flat"\n}}\nf')
+        assert proc.returncode == 0, proc.stderr
+        work_dir, local_flat = proc.stdout.strip().split('|')
+        if nvme_ok == '1':
+            assert work_dir.startswith('/opt/nvme/')
+            assert local_flat.startswith('/opt/nvme/')
+        else:
+            assert work_dir.startswith('/tmp/user-')
+            # Image-sized: beside its destination, not in /tmp.
+            assert local_flat.startswith('/proj/x/.img-flat-')
