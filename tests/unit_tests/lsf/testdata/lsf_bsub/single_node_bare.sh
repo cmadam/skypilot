@@ -33,7 +33,24 @@ trap 'exit 0' TERM
 
 # Create directories
 mkdir -p "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/sky_logs" "/proj/granite-build/g4os/skypilot/sky-gold-kd-abc123/.sky"
-mkdir -p "/opt/nvme/$USER/skypilot-tmp"
+
+# ── Node-local scratch ────────────────────────────────────────────────
+# Probed per host and not exported: see _build_node_local_scratch_block.
+SKY_NVME_OK=0
+if mkdir -p "/opt/nvme/$USER" 2>/dev/null && [[ -w "/opt/nvme/$USER" ]]; then
+    SKY_NVME_OK=1
+else
+    echo "[$(date)] WARNING: /opt/nvme is not writable on" \
+         "$(hostname -s); node-local scratch falls back to" \
+         "/tmp"
+fi
+SKY_TMPDIR="/opt/nvme/$USER/skypilot-tmp"
+if [[ "$SKY_NVME_OK" != "1" ]]; then
+    case "$SKY_TMPDIR" in
+        /opt/nvme|/opt/nvme/*) SKY_TMPDIR="/tmp${SKY_TMPDIR#/opt/nvme}" ;;
+    esac
+fi
+mkdir -p "$SKY_TMPDIR"
 
 # Remove this node's stale ready signal from previous runs. Scoped to
 # this host: a worker must not delete a peer's fresh signal.
