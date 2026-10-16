@@ -415,6 +415,20 @@ class CommandRunner:
         limit = self.max_inline_command_length()
         return self.inline_command_size(command) > limit
 
+    def get_unwrapped_mount_prefixes(self) -> List[str]:
+        """Return file_mount destination prefixes exempt from symlink-wrapping.
+
+        A runner may override this to declare filesystem roots whose file_mount
+        destinations ``_execute_file_mounts`` must leave un-wrapped (see
+        ``SlurmCommandRunner.get_unwrapped_mount_prefixes`` for the motivating
+        case).
+
+        Returns:
+            Absolute path prefixes to exempt. The base implementation returns
+            ``[]``, so a runner exempts nothing unless it overrides this.
+        """
+        return []
+
     def get_remote_home_dir(self) -> str:
         # Use pattern matching to extract home directory.
         # Some container images print MOTD when login shells start, which can
@@ -2132,6 +2146,7 @@ class SlurmCommandRunner(SlurmLoginNodeCommandRunner):
         slurm_node: str,
         container_args: Optional[str],
         slurm_user: Optional[str] = None,
+        shared_fs_roots: Optional[List[str]] = None,
         **kwargs,
     ):
         """Initialize SlurmCommandRunner.
@@ -2162,6 +2177,9 @@ class SlurmCommandRunner(SlurmLoginNodeCommandRunner):
               (compute node).
             slurm_user: Unix user that owns the Slurm allocation. None runs
               login-node commands as the SSH user.
+            shared_fs_roots: absolute path prefixes whose file_mount
+              destinations are exempt from the backend's symlink-wrap (see
+              get_unwrapped_mount_prefixes). Defaults to no exemptions.
             **kwargs: Additional arguments forwarded to SSHCommandRunner
               (e.g., ssh_proxy_command).
         """
@@ -2175,6 +2193,43 @@ class SlurmCommandRunner(SlurmLoginNodeCommandRunner):
         self.job_id = job_id
         self.slurm_node = slurm_node
         self.container_args = container_args
+        self._shared_fs_roots: List[str] = list(shared_fs_roots or [])
+
+    def get_unwrapped_mount_prefixes(self) -> List[str]:
+        """Return the shared-FS roots whose file_mounts must not be wrapped.
+
+        The backend's ``_execute_file_mounts`` sudo-symlink-wraps every
+        absolute, non-``~/``/non-``/tmp/`` destination. On Slurm every runner
+        command — file mounts included — is dispatched with ``srun`` to the
+        allocated compute node, so on a bare-host cluster the wrap's
+        ``sudo mkdir -p`` runs there as the login user, which typically has no
+        passwordless sudo: the mount fails with "sudo: a password is required".
+
+        The roots returned here (the configured Slurm ``workdir``) are safe to
+        leave un-wrapped in both execution modes:
+
+        * bare host — ``workdir`` is ``sky_base_dir``, the directory SkyPilot
+          itself creates the cluster home under, so the login user can write it
+          by construction and the payload lands at the path the job reads.
+        * container — ``sky_base_dir`` is bind-mounted identity
+          (``{sky_base_dir}:{sky_base_dir}``) into the pyxis container, so an
+          rsync to it writes through to the host filesystem at the identical
+          path. Wrapping would instead redirect the payload to
+          ``~/.sky/file_mounts`` under the container's private ``/root`` and
+          leave a host-side symlink the host cannot resolve.
+
+        Deliberate trade-off: un-wrapped roots skip
+        ``make_safe_symlink_command``'s clobber guard, so a mount onto an
+        existing directory under them rsyncs into it instead of erroring, as
+        ``~/`` and ``/tmp/`` destinations already do. That is what makes a
+        re-launch idempotent.
+
+        Returns:
+            A copy of the configured shared-FS root prefixes (``[]`` when no
+            ``workdir`` is configured, preserving the wrap for home-based
+            clusters).
+        """
+        return list(self._shared_fs_roots)
 
     def _rsync_via_srun(
         self,
