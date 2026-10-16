@@ -121,6 +121,9 @@ class CommandRunner:
             **kwargs) -> Union[Tuple[int, str, str], int]:
         ...
 
+    def get_unwrapped_mount_prefixes(self) -> List[str]:
+        ...
+
     def get_remote_home_dir(self) -> str:
         ...
 
@@ -455,8 +458,12 @@ class SlurmCommandRunner(SlurmLoginNodeCommandRunner):
         slurm_node: str,
         container_args: Optional[str] = ...,
         slurm_user: Optional[str] = ...,
+        shared_fs_roots: Optional[List[str]] = ...,
         **kwargs,
     ) -> None:
+        ...
+
+    def get_unwrapped_mount_prefixes(self) -> List[str]:
         ...
 
 
