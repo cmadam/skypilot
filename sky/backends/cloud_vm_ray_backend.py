@@ -2,6 +2,7 @@
 import copy
 import dataclasses
 import enum
+import functools
 import json
 import math
 import os
@@ -191,6 +192,43 @@ _MAX_GET_ZONE_RETRY = 3
 _JOB_ID_PATTERN = re.compile(r'Job ID: ([0-9]+)')
 _JOB_IDS_PATTERN = re.compile(r'Job IDs: ([0-9,]+)')
 _LOG_DIR_PATTERN = re.compile(r'Log Dir: ([^ ]+)')
+
+# ssh exits 255 when the connection, not the remote command, fails. Over a
+# ProxyCommand without ControlMaster (e.g. docker-image clusters) this happens
+# intermittently on fresh launches, sometimes even after the remote command
+# ran. The operations retried below are safe to repeat.
+_SSH_255_RETRIES = 3
+_SSH_255_BACKOFF_SECONDS = 5
+
+
+def _retry_on_ssh_255(run: Callable[[], Any],
+                      description: str,
+                      returncode_of: Optional[Callable[[Any], int]] = None,
+                      can_retry: Optional[Callable[[], bool]] = None) -> Any:
+    """Runs `run`, retrying while it fails with ssh's exit code 255.
+
+    A failure is a CommandError with returncode 255, or, when `returncode_of`
+    is given, a result whose return code is 255. Any other outcome is returned
+    or raised as is. `can_retry`, if given, is asked before each retry; it
+    returns False when repeating the operation would not be safe.
+    """
+    for attempt in range(_SSH_255_RETRIES + 1):
+        last = attempt == _SSH_255_RETRIES
+        try:
+            result = run()
+        except exceptions.CommandError as e:
+            if (e.returncode != 255 or last or
+                (can_retry is not None and not can_retry())):
+                raise
+        else:
+            if (returncode_of is None or returncode_of(result) != 255 or last or
+                (can_retry is not None and not can_retry())):
+                return result
+        logger.warning(f'{description} failed with ssh exit code 255; '
+                       f'retrying ({attempt + 1}/{_SSH_255_RETRIES}).')
+        time.sleep(_SSH_255_BACKOFF_SECONDS)
+    raise AssertionError('unreachable')
+
 
 # Path to the monkey-patched ray up script.
 # We don't do import then __file__ because that script needs to be filled in
@@ -4416,13 +4454,31 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             # For Slurm, run in background so that SSH returns immediately.
             # This is needed because we add the wait_for_job code above which
             # makes the command block until the job completes.
-            returncode, stdout, stderr = self.run_on_head(
-                handle,
-                job_submit_cmd,
-                stream_logs=False,
-                require_outputs=True,
-                run_in_background=is_slurm,
-                head_runner=head_runner)
+            def _job_not_queued() -> bool:
+                # Queueing twice would run set_status(PENDING) on a job that
+                # may already be running, so retry only while the job is
+                # still INIT, i.e. the first attempt never reached the
+                # cluster. On Slurm the submit runs in the background, so
+                # its status says nothing about this attempt; don't retry.
+                if is_slurm:
+                    return False
+                try:
+                    statuses = self.get_job_status(handle, [job_id],
+                                                   stream_logs=False)
+                except Exception:  # pylint: disable=broad-except
+                    return False
+                return statuses.get(job_id) == job_lib.JobStatus.INIT
+
+            returncode, stdout, stderr = _retry_on_ssh_255(
+                lambda: self.run_on_head(handle,
+                                         job_submit_cmd,
+                                         stream_logs=False,
+                                         require_outputs=True,
+                                         run_in_background=is_slurm,
+                                         head_runner=head_runner),
+                f'Submitting job {job_id}',
+                returncode_of=lambda result: result[0],
+                can_retry=_job_not_queued)
             # Happens when someone calls `sky exec` but remote is outdated for
             # running a job. Necessitating calling `sky launch`.
             backend_utils.check_stale_runtime_on_remote(returncode, stderr,
@@ -4506,18 +4562,21 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 run_timestamp=self.run_timestamp,
                 resources_str=resources_str,
                 metadata=metadata)
-            returncode, result_str, stderr = self.run_on_head(
-                handle,
-                code,
-                stream_logs=False,
-                require_outputs=True,
-                separate_stderr=True)
+            # A retry after an attempt that did reach the cluster leaves an
+            # unused job id, which the skylet marks FAILED_DRIVER once its
+            # INIT grace period passes.
+            returncode, result_str, stderr = _retry_on_ssh_255(
+                lambda: self.run_on_head(handle,
+                                         code,
+                                         stream_logs=False,
+                                         require_outputs=True,
+                                         separate_stderr=True),
+                'Adding a job',
+                returncode_of=lambda result: result[0])
             # Happens when someone calls `sky exec` but remote is outdated for
             # adding a job. Necessitating calling `sky launch`.
             backend_utils.check_stale_runtime_on_remote(returncode, stderr,
                                                         handle.cluster_name)
-            # TODO(zhwu): this sometimes will unexpectedly fail, we can add
-            # retry for this, after we figure out the reason.
             subprocess_utils.handle_returncode(returncode, code,
                                                'Failed to fetch job id.',
                                                stderr)
@@ -6795,21 +6854,24 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 sync_cmd,
             ]
             command = ' && '.join(download_target_commands)
-            # dst is only used for message printing.
-            backend_utils.parallel_data_transfer_to_nodes(
-                runners,
-                source=src,
-                target=dst,
-                cmd=command,
-                run_rsync=False,
-                action_message='Syncing',
-                log_path=log_path,
-                stream_logs=False,
-                # Need to source bashrc, as the cloud specific CLI or SDK may
-                # require PATH in bashrc.
-                source_bashrc=True,
-                num_threads=num_threads,
-            )
+            # dst is only used for message printing. The sync is idempotent.
+            _retry_on_ssh_255(
+                functools.partial(
+                    backend_utils.parallel_data_transfer_to_nodes,
+                    runners,
+                    source=src,
+                    target=dst,
+                    cmd=command,
+                    run_rsync=False,
+                    action_message='Syncing',
+                    log_path=log_path,
+                    stream_logs=False,
+                    # Need to source bashrc, as the cloud specific CLI or SDK
+                    # may require PATH in bashrc.
+                    source_bashrc=True,
+                    num_threads=num_threads,
+                ),
+                f'Syncing {src} to {dst}')
         # (2) Run the commands to create symlinks on all the nodes.
         symlink_command = ' && '.join(symlink_commands)
         if symlink_command:
@@ -6821,7 +6883,12 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 f'{symlink_command}')
 
             def _symlink_node(runner: command_runner.CommandRunner):
-                returncode = runner.run(symlink_command, log_path=log_path)
+                # The symlink command replaces an existing link, so it is
+                # safe to repeat.
+                returncode = _retry_on_ssh_255(
+                    lambda: runner.run(symlink_command, log_path=log_path),
+                    'Creating file_mounts symlinks',
+                    returncode_of=lambda rc: rc)
                 subprocess_utils.handle_returncode(
                     returncode, symlink_command,
                     'Failed to create symlinks. The target destination '
@@ -6907,19 +6974,26 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
             if isinstance(src_print, list):
                 src_print = ', '.join(src_print)
             try:
-                backend_utils.parallel_data_transfer_to_nodes(
-                    runners,
-                    source=src_print,
-                    target=dst,
-                    cmd=mount_cmd,
-                    run_rsync=False,
-                    action_message=action_message,
-                    log_path=log_path,
-                    # Need to source bashrc, as the cloud specific CLI or SDK
-                    # may require PATH in bashrc.
-                    source_bashrc=True,
-                    num_threads=num_threads,
-                )
+                # The mount script unmounts an already-mounted path first, so
+                # it is safe to repeat. Other failures (e.g.
+                # MOUNT_PATH_NON_EMPTY_CODE) are raised at once and handled
+                # below.
+                _retry_on_ssh_255(
+                    functools.partial(
+                        backend_utils.parallel_data_transfer_to_nodes,
+                        runners,
+                        source=src_print,
+                        target=dst,
+                        cmd=mount_cmd,
+                        run_rsync=False,
+                        action_message=action_message,
+                        log_path=log_path,
+                        # Need to source bashrc, as the cloud specific CLI or
+                        # SDK may require PATH in bashrc.
+                        source_bashrc=True,
+                        num_threads=num_threads,
+                    ),
+                    f'Mounting {src_print} at {dst}')
             except exceptions.CommandError as e:
                 if e.returncode == exceptions.MOUNT_PATH_NON_EMPTY_CODE:
                     mount_path = (f'{colorama.Fore.RED}'
