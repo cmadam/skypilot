@@ -102,7 +102,10 @@ def get_s3_mount_install_cmd() -> str:
         # Extract core rclone installation logic without redundant ARCH check
         f'  {get_rclone_install_cmd()}; '
         'else '
-        '  sudo wget -nc https://github.com/aylei/goofys/'
+        # No -nc: with -O, an existing goofys (0-byte or partial from an
+        # earlier attempt) makes wget skip the download, and the mount then
+        # fails to execute it.
+        '  sudo wget https://github.com/aylei/goofys/'
         'releases/download/0.24.0-ec7d1b84/goofys-linux-amd64 '
         '-O /usr/local/bin/goofys && '
         'sudo chmod 755 /usr/local/bin/goofys; '
