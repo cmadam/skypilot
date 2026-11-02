@@ -288,6 +288,51 @@ class TestTerminateInstances:
             mock.call(_CLUSTER, signal='TERM', full=True),
         ]
 
+    def test_duplicate_jobs_are_all_cancelled(self, mock_client, monkeypatch):
+        # An orphaned earlier allocation shares the cluster's name.
+        mock_client.query_jobs.return_value = ['101', '102']
+        mock_client.get_jobs_state_by_name.side_effect = [[
+            'RUNNING', 'RUNNING'
+        ], []]
+        cleanup = mock.MagicMock()
+        monkeypatch.setattr(instance, '_cleanup_slurm_allocation', cleanup)
+
+        instance.terminate_instances(_CLUSTER, provider_config=_PROVIDER_CONFIG)
+
+        assert mock_client.cancel_jobs_by_name.call_args_list == [
+            mock.call(_CLUSTER)
+        ]
+        cleanup.assert_not_called()
+
+    def test_duplicate_jobs_already_exiting_no_cancel(self, mock_client):
+        mock_client.query_jobs.return_value = []
+        mock_client.get_jobs_state_by_name.return_value = [
+            'COMPLETING', 'CANCELLED'
+        ]
+        instance.terminate_instances(_CLUSTER, provider_config=_PROVIDER_CONFIG)
+        mock_client.cancel_jobs_by_name.assert_not_called()
+
+    def test_duplicate_jobs_that_stay_raise(self, mock_client):
+        mock_client.query_jobs.return_value = ['101', '102']
+        mock_client.get_jobs_state_by_name.return_value = ['RUNNING', 'PENDING']
+        with pytest.raises(RuntimeError, match='may be leaked'):
+            instance.terminate_instances(_CLUSTER,
+                                         provider_config=_PROVIDER_CONFIG)
+        assert mock_client.cancel_jobs_by_name.call_args_list == [
+            mock.call(_CLUSTER)
+        ]
+
+    def test_duplicate_jobs_inside_cluster_does_not_wait(
+            self, mock_client, monkeypatch):
+        monkeypatch.setattr(instance.slurm_utils, 'is_inside_slurm_cluster',
+                            mock.MagicMock(return_value=True))
+        mock_client.get_jobs_state_by_name.return_value = ['RUNNING', 'RUNNING']
+        instance.terminate_instances(_CLUSTER, provider_config=_PROVIDER_CONFIG)
+        assert mock_client.cancel_jobs_by_name.call_args_list == [
+            mock.call(_CLUSTER)
+        ]
+        assert mock_client.get_jobs_state_by_name.call_count == 1
+
     def test_pre_batch_cleanup_runs_between_step_and_batch_term(
             self, monkeypatch):
         client = mock.MagicMock()

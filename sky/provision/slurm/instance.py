@@ -2056,6 +2056,43 @@ rm -rf -- {shlex.quote(skypilot_runtime_dir)}
         'Failed to clean up shared Slurm cluster state before cancellation.')
 
 
+def _cancel_duplicate_slurm_jobs(
+    client: 'slurm.SlurmClient',
+    cluster_name_on_cloud: str,
+    job_states: List[str],
+    inside_slurm_cluster: bool,
+) -> None:
+    """Cancel every Slurm job that carries the cluster's name.
+
+    A cluster normally has one allocation. A second one with the same name
+    is left behind when an earlier allocation was never cancelled, e.g. a
+    launch that failed before its job id was recorded. The per-job graceful
+    sequence in _cancel_slurm_job can't tell the jobs apart, so cancel them
+    all with a plain scancel (Slurm's TERM -> KillWait -> KILL), which still
+    runs each batch script's EXIT trap, and require them to leave the queue.
+    """
+    if all(state in _EXITING_JOB_STATES for state in job_states):
+        logger.debug(f'All jobs for cluster {cluster_name_on_cloud} are '
+                     f'already exiting ({job_states}). No action needed.')
+        return
+    logger.warning(f'Found {len(job_states)} Slurm jobs named '
+                   f'{cluster_name_on_cloud} ({job_states}); cancelling all '
+                   'of them.')
+    client.cancel_jobs_by_name(cluster_name_on_cloud)
+    if inside_slurm_cluster:
+        # The scancel reaps the skylet running this code, so a wait
+        # could never complete. The EXIT traps do the cleanup.
+        return
+    if not _wait_for_job_states(client, cluster_name_on_cloud,
+                                _TERMINAL_JOB_STATES,
+                                _JOB_TERMINATION_TIMEOUT_SECONDS):
+        raise RuntimeError(
+            f'Slurm jobs for cluster {cluster_name_on_cloud} are still '
+            f'running {_JOB_TERMINATION_TIMEOUT_SECONDS}s after scancel. '
+            'The allocations may be leaked; check squeue and cancel the '
+            'jobs manually if needed.')
+
+
 def _cancel_slurm_job(
     client: 'slurm.SlurmClient',
     cluster_name_on_cloud: str,
@@ -2071,9 +2108,11 @@ def _cancel_slurm_job(
         logger.debug(f'Job for cluster {cluster_name_on_cloud} not found, '
                      'it may have been terminated.')
         return
-    assert len(jobs_state) == 1, (
-        f'Multiple jobs found for cluster {cluster_name_on_cloud}: {jobs_state}'
-    )
+    if len(jobs_state) > 1:
+        _cancel_duplicate_slurm_jobs(client, cluster_name_on_cloud,
+                                     [state.strip() for state in jobs_state],
+                                     inside_slurm_cluster)
+        return
 
     job_state = jobs_state[0].strip()
     if job_state in _TERMINAL_JOB_STATES:
@@ -2179,9 +2218,8 @@ def terminate_instances(
     if not inside_slurm_cluster:
         running_jobs = client.query_jobs(cluster_name_on_cloud,
                                          ['running', 'suspended'])
-        if len(running_jobs) > 1:
-            raise RuntimeError(f'Multiple running jobs found for cluster '
-                               f'{cluster_name_on_cloud}: {running_jobs}')
+        # With several same-named jobs, _cancel_slurm_job cancels them all
+        # and their EXIT traps clean up, so skip the per-job node cleanup.
         if len(running_jobs) == 1:
             job_id = running_jobs[0]
             nodes, _ = client.get_job_nodes(job_id)
