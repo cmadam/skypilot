@@ -64,6 +64,8 @@ CONTAINER_START=$SECONDS
 echo "[container] Initializing test-cluster on all nodes"
 rm -rf /home/testuser/.sky_clusters/test-cluster/.sky_container_init_done
 mkdir -p /home/testuser/.sky_clusters/test-cluster/.sky_container_init_done
+export NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES:-all}"
+export NVIDIA_DRIVER_CAPABILITIES="${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}"
 srun --overlap --unbuffered --nodes=1 --ntasks-per-node=1 bash -c 'while IFS= read -r candidate; do
     if [ "$candidate" = pyxis_test-cluster ]; then
         enroot remove -f "$candidate" || exit 1
@@ -71,7 +73,7 @@ srun --overlap --unbuffered --nodes=1 --ntasks-per-node=1 bash -c 'while IFS= re
 done < <(enroot list)
 ' || { echo "[container] ERROR: Failed to remove stale container pyxis_test-cluster." >&2; exit 1; }
 CONTAINER_PIDS=()
-srun --overlap --job-name=sky-container-keeper --unbuffered --nodes=1 --ntasks-per-node=1 --container-image='nvcr.io#nvidia/pytorch:24.01-py3' --container-name=test-cluster:create --container-mounts="/home/testuser:/home/testuser,/tmp/ccache_$(id -u):/var/cache/ccache,/tmp/test-cluster/.sky:/tmp/test-cluster/.sky" --container-remap-root --no-container-mount-home --container-writable bash -c 'set -e
+srun --overlap --job-name=sky-container-keeper --unbuffered --nodes=1 --ntasks-per-node=1 --container-image='nvcr.io#nvidia/pytorch:24.01-py3' --container-name=test-cluster:create --container-mounts="/home/testuser:/home/testuser,/tmp/ccache_$(id -u):/var/cache/ccache,/tmp/test-cluster/.sky:/tmp/test-cluster/.sky" --container-remap-root --no-container-mount-home --container-writable --container-env=NVIDIA_VISIBLE_DEVICES,NVIDIA_DRIVER_CAPABILITIES bash -c 'set -e
 echo "[container-init] Starting..."
 INIT_START=$SECONDS
 # A dpkg statoverride that names a group the image no longer has (e.g.

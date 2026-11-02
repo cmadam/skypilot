@@ -1706,6 +1706,31 @@ srun() {{
     @patch('sky.provision.slurm.instance.slurm.SlurmClient')
     @patch('sky.provision.slurm.instance.command_runner.'
            'SlurmLoginNodeCommandRunner')
+    def test_cpu_container_gets_no_nvidia_env(self, mock_ssh_runner,
+                                              mock_slurm_client,
+                                              mock_get_partition_info,
+                                              mock_get_proctrack_type,
+                                              mock_wait_for_job_nodes):
+        """Only GPU containers get the NVIDIA driver env passed in."""
+        del mock_wait_for_job_nodes
+        self._setup_mocks(mock_ssh_runner, mock_slurm_client,
+                          mock_get_partition_info, 'cpus')
+        mock_get_proctrack_type.return_value = 'cgroup'
+        config = self._make_non_container_config(1)
+        config.node_config['image_id'] = 'ubuntu:24.04'
+
+        script = self._run_and_capture_script('test-cluster', config)
+
+        assert '--container-image=ubuntu:24.04' in script
+        assert 'NVIDIA_VISIBLE_DEVICES' not in script
+        assert '--container-env' not in script
+
+    @patch('sky.provision.slurm.instance._wait_for_job_nodes')
+    @patch('sky.provision.slurm.instance.slurm_utils.get_proctrack_type')
+    @patch('sky.provision.slurm.instance.slurm_utils.get_partition_info')
+    @patch('sky.provision.slurm.instance.slurm.SlurmClient')
+    @patch('sky.provision.slurm.instance.command_runner.'
+           'SlurmLoginNodeCommandRunner')
     def test_restore_cleans_leftover_shared_state(self, mock_ssh_runner,
                                                   mock_slurm_client,
                                                   mock_get_partition_info,

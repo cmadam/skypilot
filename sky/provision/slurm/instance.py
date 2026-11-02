@@ -1073,6 +1073,20 @@ echo "[container-init] Packages installed in $((SECONDS - INIT_START))s"
                       f'--container-remap-root '
                       f'--no-container-mount-home '
                       f'--container-writable')
+        # enroot's NVIDIA hook injects the driver (libcuda.so.1) only when
+        # NVIDIA_VISIBLE_DEVICES is set. Images that are not built on a CUDA
+        # base don't set it, so CUDA then fails to load in the container.
+        # Set defaults on the host and pass them in, keeping any value the
+        # host environment already has.
+        nvidia_env_block = ''
+        if accelerator_count > 0:
+            nvidia_env_block = (
+                'export NVIDIA_VISIBLE_DEVICES='
+                '"${NVIDIA_VISIBLE_DEVICES:-all}"\n'
+                'export NVIDIA_DRIVER_CAPABILITIES='
+                '"${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}"\n')
+            pyxis_args += (' --container-env='
+                           'NVIDIA_VISIBLE_DEVICES,NVIDIA_DRIVER_CAPABILITIES')
         global_enroot_name = _enroot_container_name_global_scope(
             cluster_name_on_cloud)
         remove_stale_container_script = f"""\
@@ -1183,6 +1197,7 @@ exit 1
             f'echo "[container] Initializing {container_name} on all nodes"\n'
             f'rm -rf {container_init_done_dir}\n'
             f'mkdir -p {container_init_done_dir}\n'
+            f'{nvidia_env_block}'
             f'{container_launch_block}\n'
             f'while true; do\n'
             f'  for container_pid in "${{CONTAINER_PIDS[@]}}"; do\n'
