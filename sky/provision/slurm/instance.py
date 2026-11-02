@@ -1051,6 +1051,14 @@ def _create_virtual_instance(
 set -e
 echo "[container-init] Starting..."
 INIT_START=$SECONDS
+# A dpkg statoverride that names a group the image no longer has (e.g.
+# messagebus) makes every apt-get install abort. Drop those entries.
+if command -v dpkg-statoverride >/dev/null 2>&1; then
+    dpkg-statoverride --list | while read -r _ group _ path; do
+        getent group "$group" >/dev/null ||
+            dpkg-statoverride --remove "$path" || true
+    done
+fi
 apt-get update
 apt-get install -y ca-certificates rsync curl git wget fuse
 # Some images set HOME to a directory they do not ship.
