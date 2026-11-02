@@ -1053,7 +1053,9 @@ echo "[container-init] Starting..."
 INIT_START=$SECONDS
 apt-get update
 apt-get install -y ca-certificates rsync curl git wget fuse
-echo 'alias sudo=""' >> ~/.bashrc
+# Some images set HOME to a directory they do not ship.
+mkdir -p "$HOME"
+echo 'alias sudo=""' >> "$HOME/.bashrc"
 echo "[container-init] Packages installed in $((SECONDS - INIT_START))s"
 """
         container_init_done_dir = (
