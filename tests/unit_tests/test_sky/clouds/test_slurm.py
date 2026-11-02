@@ -1731,6 +1731,41 @@ srun() {{
     @patch('sky.provision.slurm.instance.slurm.SlurmClient')
     @patch('sky.provision.slurm.instance.command_runner.'
            'SlurmLoginNodeCommandRunner')
+    def test_host_rsync_fallback_is_opt_in(self, mock_ssh_runner,
+                                           mock_slurm_client,
+                                           mock_get_partition_info,
+                                           mock_get_proctrack_type,
+                                           mock_wait_for_job_nodes):
+        """The init falls back to a host rsync only if one is mounted."""
+        del mock_wait_for_job_nodes
+        self._setup_mocks(mock_ssh_runner, mock_slurm_client,
+                          mock_get_partition_info, 'cpus')
+        mock_get_proctrack_type.return_value = 'cgroup'
+        config = self._make_non_container_config(1)
+        config.node_config['image_id'] = 'ubuntu:24.04'
+
+        script = self._run_and_capture_script('test-cluster', config)
+        host_rsync = slurm_instance._HOST_RSYNC_IN_CONTAINER
+        assert f'[ -x {host_rsync} ]' in script
+        assert f':{host_rsync}' not in script
+
+        config.node_config['volume_mounts'] = [{
+            'path': host_rsync,
+            'volume_config': {
+                'config': {
+                    'host_path': '/usr/bin/rsync'
+                }
+            },
+        }]
+        script = self._run_and_capture_script('test-cluster', config)
+        assert f'/usr/bin/rsync:{host_rsync}:ro' in script
+
+    @patch('sky.provision.slurm.instance._wait_for_job_nodes')
+    @patch('sky.provision.slurm.instance.slurm_utils.get_proctrack_type')
+    @patch('sky.provision.slurm.instance.slurm_utils.get_partition_info')
+    @patch('sky.provision.slurm.instance.slurm.SlurmClient')
+    @patch('sky.provision.slurm.instance.command_runner.'
+           'SlurmLoginNodeCommandRunner')
     def test_restore_cleans_leftover_shared_state(self, mock_ssh_runner,
                                                   mock_slurm_client,
                                                   mock_get_partition_info,

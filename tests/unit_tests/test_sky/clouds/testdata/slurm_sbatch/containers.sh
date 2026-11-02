@@ -84,8 +84,19 @@ if command -v dpkg-statoverride >/dev/null 2>&1; then
             dpkg-statoverride --remove "$path" || true
     done
 fi
-apt-get update
-apt-get install -y ca-certificates rsync curl git wget fuse
+if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y ca-certificates rsync curl git wget fuse
+else
+    echo "[container-init] No apt-get; skipping package installation"
+fi
+# An image with neither rsync nor apt-get can use the host'"'"'s rsync, if an
+# admin mounts it at /opt/sky-host-tools/rsync through slurm.container_mounts.
+if ! command -v rsync >/dev/null 2>&1 && [ -x /opt/sky-host-tools/rsync ]; then
+    mkdir -p /usr/local/bin
+    ln -sf /opt/sky-host-tools/rsync /usr/local/bin/rsync
+    echo "[container-init] Using the host rsync from /opt/sky-host-tools/rsync"
+fi
 # Some images set HOME to a directory they do not ship.
 mkdir -p "$HOME"
 echo '"'"'alias sudo=""'"'"' >> "$HOME/.bashrc"

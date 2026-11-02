@@ -61,6 +61,10 @@ _JOB_TERMINATION_TIMEOUT_SECONDS = 60
 # before escalating to a plain scancel. Matches Slurm's default KillWait,
 # the grace Slurm itself gives between SIGTERM and SIGKILL.
 _TERMINATION_GRACE_PERIOD_SECONDS = 30
+# Where the container init looks for a host rsync, for images that have
+# neither rsync nor apt-get. An admin provides it through
+# slurm.container_mounts, e.g. `/opt/sky-host-tools/rsync: /usr/bin/rsync`.
+_HOST_RSYNC_IN_CONTAINER = '/opt/sky-host-tools/rsync'
 # Workloads get longer than Slurm's default 30-second KillWait to finish their
 # TERM handlers before the stop path escalates individual steps to KILL.
 _WORKLOAD_STEP_TERM_GRACE_PERIOD_SECONDS = 40
@@ -1059,13 +1063,24 @@ if command -v dpkg-statoverride >/dev/null 2>&1; then
             dpkg-statoverride --remove "$path" || true
     done
 fi
-apt-get update
-apt-get install -y ca-certificates rsync curl git wget fuse
+if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y ca-certificates rsync curl git wget fuse
+else
+    echo "[container-init] No apt-get; skipping package installation"
+fi
+# An image with neither rsync nor apt-get can use the host's rsync, if an
+# admin mounts it at __HOST_RSYNC__ through slurm.container_mounts.
+if ! command -v rsync >/dev/null 2>&1 && [ -x __HOST_RSYNC__ ]; then
+    mkdir -p /usr/local/bin
+    ln -sf __HOST_RSYNC__ /usr/local/bin/rsync
+    echo "[container-init] Using the host rsync from __HOST_RSYNC__"
+fi
 # Some images set HOME to a directory they do not ship.
 mkdir -p "$HOME"
 echo 'alias sudo=""' >> "$HOME/.bashrc"
 echo "[container-init] Packages installed in $((SECONDS - INIT_START))s"
-"""
+""".replace('__HOST_RSYNC__', _HOST_RSYNC_IN_CONTAINER)
         container_init_done_dir = (
             f'{sky_cluster_home_dir}/.sky_container_init_done')
         pyxis_args = (f'--container-name={shlex.quote(container_name)}:create '

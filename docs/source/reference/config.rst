@@ -2665,6 +2665,17 @@ Example:
 :ref:`cluster_configs <config-yaml-slurm-cluster-configs>`. Entries are merged
 per container path, with per-cluster values overriding global values.
 
+Container mounts also serve two common needs on GPU clusters:
+
+- **InfiniBand:** if ``/dev`` is restricted in the container
+  (``ENROOT_RESTRICT_DEV``), multi-node NCCL needs the IB devices:
+  ``/dev/infiniband: /dev/infiniband``.
+- **Images without rsync:** SkyPilot installs rsync with ``apt-get`` when an
+  image lacks it. For images that have neither (for example, some RHEL-based
+  images), mount the host's rsync at ``/opt/sky-host-tools/rsync``, and the
+  container uses it: ``/opt/sky-host-tools/rsync: /usr/bin/rsync``. The host
+  rsync's shared libraries must exist in the image.
+
 .. _config-yaml-slurm-quota:
 
 ``slurm.quota``
