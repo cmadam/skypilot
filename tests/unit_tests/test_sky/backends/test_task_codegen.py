@@ -193,6 +193,59 @@ def test_slurm_single_node_with_gpu():
                                     testdata_dir=SLURM_TESTDATA_DIR)
 
 
+def _job_cpus_per_node_helper(task_cpu_demand: float) -> str:
+    """Return the generated driver's _job_cpus_per_node() source."""
+    codegen = task_codegen.SlurmCodeGen(slurm_job_id='12345',
+                                        container_name=None)
+    codegen.add_prologue(job_id=2)
+    codegen.add_setup(1,
+                      resources_dict={'CPU': task_cpu_demand},
+                      stable_cluster_internal_ips=['10.0.0.1'],
+                      env_vars={},
+                      log_dir='/sky/logs')
+    codegen.add_task(1,
+                     bash_script='true',
+                     task_name='t',
+                     resources_dict={'CPU': task_cpu_demand},
+                     log_dir='/sky/logs/tasks',
+                     env_vars={})
+    codegen.add_epilogue()
+    code = codegen.build()
+    start = code.index('def _job_cpus_per_node():')
+    end = code.index('def run_thread_func():', start)
+    lines = code[start:end].splitlines()
+    indent = len(lines[0]) - len(lines[0].lstrip())
+    return '\n'.join(line[indent:] for line in lines) + '\n'
+
+
+@pytest.mark.parametrize('squeue_script,task_cpu_demand,expected', [
+    ('echo 64', 1.0, 64),
+    ('echo 2', 4.0, 4),
+    ('exit 1', 4.0, 4),
+    ('echo garbage', 1.0, 1),
+])
+def test_slurm_run_step_uses_job_cpus(tmp_path, squeue_script, task_cpu_demand,
+                                      expected):
+    """The run step asks Slurm for the job's CPUs, not the task demand."""
+    fake_bin = tmp_path / 'bin'
+    fake_bin.mkdir()
+    squeue = fake_bin / 'squeue'
+    squeue.write_text(f'#!/bin/bash\n{squeue_script}\n')
+    squeue.chmod(0o755)
+    program = ('import subprocess\n' +
+               _job_cpus_per_node_helper(task_cpu_demand) +
+               'print(_job_cpus_per_node())\n')
+    result = subprocess.run(
+        ['python3', '-c', program],
+        env={
+            **os.environ, 'PATH': f'{fake_bin}:{os.environ["PATH"]}'
+        },
+        capture_output=True,
+        text=True,
+        check=True)
+    assert int(result.stdout) == expected
+
+
 def test_slurm_codegen_with_container():
     codegen = task_codegen.SlurmCodeGen(
         slurm_job_id='12345',

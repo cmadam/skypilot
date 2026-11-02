@@ -952,10 +952,24 @@ class SlurmCodeGen(TaskCodeGen):
 
                     return srun_cmd, cleanup
 
+                def _job_cpus_per_node():
+                    # Slurm binds the run step's task to --cpus-per-task cores.
+                    # The task's CPU demand (1 by default) would put every
+                    # rank of a multi-GPU task on one core, so use the CPUs the
+                    # allocation holds per node. Fall back to the demand if
+                    # squeue fails.
+                    try:
+                        result = subprocess.run(
+                            ['squeue', '-h', '-j', {self._slurm_job_id!r}, '-o', '%c'],
+                            capture_output=True, text=True, timeout=30, check=False)
+                        return max({task_cpu_demand}, int(result.stdout.split()[0]))
+                    except Exception:  # pylint: disable=broad-except
+                        return {task_cpu_demand}
+
                 def run_thread_func():
                     # This blocks until Slurm allocates resources (--exclusive)
                     # --mem=0 to match RayCodeGen's behavior where we don't explicitly request memory.
-                    run_flags = f'--nodes={num_nodes} --cpus-per-task={task_cpu_demand} --mem=0 {{gpu_arg}} --exclusive'
+                    run_flags = f'--nodes={num_nodes} --cpus-per-task={{_job_cpus_per_node()}} --mem=0 {{gpu_arg}} --exclusive'
                     srun_cmd, cleanup = build_task_runner_cmd(
                         script, run_flags, {log_dir!r}, sky_env_vars_dict,
                         task_name={task_name!r},
