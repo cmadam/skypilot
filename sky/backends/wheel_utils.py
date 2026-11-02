@@ -223,6 +223,24 @@ def _build_sky_wheel() -> pathlib.Path:
         return wheel_dir / wheel_path.name
 
 
+def _replace_file_atomically(src: pathlib.Path, dst_dir: pathlib.Path) -> None:
+    """Copy src into dst_dir so readers never see a partial file.
+
+    Concurrent launches read the per-hash wheel outside the wheel lock (when
+    staging file mounts). shutil.copy truncates and rewrites the file in
+    place, so a reader could ship a 0-byte wheel and the remote install would
+    fail with "Failed to read metadata". Copying to a private file and
+    renaming it into place means readers see the old or the new file whole.
+    """
+    tmp_path = dst_dir / f'.{src.name}.{os.getpid()}.tmp'
+    try:
+        shutil.copy(src, tmp_path)
+        os.replace(tmp_path, dst_dir / src.name)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
 def build_sky_wheel() -> Tuple[pathlib.Path, str]:
     """Build a wheel for SkyPilot, or reuse a cached wheel.
 
@@ -306,6 +324,6 @@ def build_sky_wheel() -> Tuple[pathlib.Path, str]:
         # wheel content hash doesn't change.
         temp_wheel_dir = pathlib.Path(tempfile.gettempdir()) / wheel_hash
         temp_wheel_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy(latest_wheel, temp_wheel_dir)
+        _replace_file_atomically(latest_wheel, temp_wheel_dir)
 
     return temp_wheel_dir.absolute(), wheel_hash
