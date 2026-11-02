@@ -1,6 +1,7 @@
 """Unit tests for sky/server/requests/process.py."""
 from concurrent.futures import Future
 import concurrent.futures.process
+import sys
 import time
 import unittest.mock
 
@@ -205,3 +206,50 @@ def test_burstable_executor_pool_recovery():
 
     finally:
         executor.shutdown()
+
+
+def _worker_pid():
+    """Return the PID of the worker running this task."""
+    import os  # pylint: disable=import-outside-toplevel
+    return os.getpid()
+
+
+@pytest.mark.parametrize('raw,expected', [
+    (None, 100),
+    ('7', 7),
+    ('0', None),
+    ('-3', None),
+    ('not-a-number', 100),
+])
+def test_guaranteed_worker_max_tasks(monkeypatch, raw, expected):
+    from sky.server.requests import process  # pylint: disable=import-outside-toplevel
+    if raw is None:
+        monkeypatch.delenv(process._GUARANTEED_WORKER_MAX_TASKS_ENV,
+                           raising=False)
+    else:
+        monkeypatch.setenv(process._GUARANTEED_WORKER_MAX_TASKS_ENV, raw)
+    assert process._guaranteed_worker_max_tasks() == expected
+
+
+def test_guaranteed_worker_max_tasks_off_before_python_311(monkeypatch):
+    from sky.server.requests import process  # pylint: disable=import-outside-toplevel
+    monkeypatch.setenv(process._GUARANTEED_WORKER_MAX_TASKS_ENV, '5')
+    monkeypatch.setattr(process.sys, 'version_info', (3, 10, 14))
+    assert process._guaranteed_worker_max_tasks() is None
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11),
+                    reason='max_tasks_per_child needs Python 3.11+')
+@pytest.mark.parametrize('max_tasks,expected_pids', [('2', 3), ('0', 1)])
+def test_guaranteed_workers_are_recycled(monkeypatch, max_tasks, expected_pids):
+    from sky.server.requests import process  # pylint: disable=import-outside-toplevel
+    monkeypatch.setenv(process._GUARANTEED_WORKER_MAX_TASKS_ENV, max_tasks)
+    executor = BurstableExecutor(garanteed_workers=1, burst_workers=0)
+    try:
+        pids = [
+            executor.submit_until_success(_worker_pid).result(timeout=60)
+            for _ in range(6)
+        ]
+    finally:
+        executor.shutdown()
+    assert len(set(pids)) == expected_pids

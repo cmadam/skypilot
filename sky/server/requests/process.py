@@ -2,6 +2,8 @@
 import concurrent.futures
 import logging
 import multiprocessing
+import os
+import sys
 import threading
 import time
 from typing import Callable, Dict, Optional, Tuple
@@ -11,6 +13,31 @@ from sky.utils import atomic
 from sky.utils import subprocess_utils
 
 logger = logging.getLogger(__name__)
+
+# Requests a guaranteed (reused) worker serves before it is replaced. 0 turns
+# recycling off, so workers live as long as the server.
+_GUARANTEED_WORKER_MAX_TASKS_ENV = 'SKYPILOT_API_SERVER_WORKER_MAX_TASKS'
+_DEFAULT_GUARANTEED_WORKER_MAX_TASKS = 100
+
+
+def _guaranteed_worker_max_tasks() -> Optional[int]:
+    """Requests per guaranteed worker, or None to never recycle.
+
+    Always None before Python 3.11, which lacks max_tasks_per_child.
+    """
+    if sys.version_info < (3, 11):
+        return None
+    raw = os.environ.get(_GUARANTEED_WORKER_MAX_TASKS_ENV)
+    if raw is None:
+        return _DEFAULT_GUARANTEED_WORKER_MAX_TASKS
+    try:
+        max_tasks = int(raw)
+    except ValueError:
+        logger.warning(f'Ignoring invalid {_GUARANTEED_WORKER_MAX_TASKS_ENV}='
+                       f'{raw!r}; using '
+                       f'{_DEFAULT_GUARANTEED_WORKER_MAX_TASKS}.')
+        return _DEFAULT_GUARANTEED_WORKER_MAX_TASKS
+    return max_tasks if max_tasks > 0 else None
 
 
 class PoolExecutor(concurrent.futures.ProcessPoolExecutor):
@@ -206,10 +233,18 @@ class BurstableExecutor:
                  **kwargs):
         if garanteed_workers > 0:
             self._guaranteed_workers = garanteed_workers
-            self._guaranteed_pool_kwargs = kwargs
+            # A reused worker keeps its peak RSS (CPython rarely returns freed
+            # memory to the OS), so under steady load long-lived workers grow
+            # without bound. Replace each one after a number of requests. The
+            # burst pool already uses one process per request.
+            pool_kwargs = dict(kwargs)
+            max_tasks = _guaranteed_worker_max_tasks()
+            if max_tasks is not None:
+                pool_kwargs['max_tasks_per_child'] = max_tasks
+            self._guaranteed_pool_kwargs = pool_kwargs
             self._guaranteed_pool_lock = threading.Lock()
             self._executor = PoolExecutor(max_workers=garanteed_workers,
-                                          **kwargs)
+                                          **pool_kwargs)
         if burst_workers > 0:
             self._burst_executor = DisposableExecutor(max_workers=burst_workers,
                                                       **kwargs)
